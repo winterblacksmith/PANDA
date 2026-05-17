@@ -1,0 +1,28 @@
+column_name,definition
+city_ID,Unique identifier given to the tree by the city
+tree_ID,our unique identifier for each tree
+planted_date,date tree was planted
+most_recent_observation,"most recent observation date of tree (among dates such as condition_date, edit_date, inspect_date)"
+retired_date,date tree was retired.
+most_recent_observation_type,"what is the most recent observation? condition_date, edit_date, etc."
+common_name,plain english common name of the tree species
+scientific_name,biological name of the tree species (Quercus rubrus)
+greater_metro,"greater metro area in which the city is found, which will match the ""city name"" in the filename (Atlanta, for example, which includes Decatur and other suburbs)"
+city,"city name, as it is properly spelled (Las Vegas)"
+state,"state name (as it is properly spelled, not abbreviation)"
+longitude_coordinate,exact location of tree species (longitude)
+latitude_coordinate,exact location of tree species (latitude)
+location_type,"where the tree is located, whether in a park or an urban area (green_space, built_environment, no_info)"
+zipcode,zipcode of the location
+address,address where the data was collected
+neighborhood,neighborhood of the location of the tree
+location_name,"If the location is named without being an address, such as Smith Cemetary or Route 11 Median"
+ward,city ward
+district,the district tree is located
+overhead_utility,"Is there an overhead utility (yes, no, conflicting)?"
+diameter_breast_height_CM,trunk diameter in cm at breast height
+condition,tree condition as coded by the city-specific protocol converted to standardized conditions
+height_M,height of tree in meters
+native,"Is the tree native to the state (""naturally_occurring""), not native (""introduced""), or of unknown status due, for example, to being only genus level (""no_info"")? Assignments according to Biota of North America Project data."
+height_binned_M,"range of heights into which the tree falls, converted from feet."
+diameter_breast_height_binned_CM,"range of diameters into which the tree falls, converted from inches often"
