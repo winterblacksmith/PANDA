@@ -12,10 +12,6 @@ from streamlit_folium import st_folium
 DATA_DIR = Path("data")
 
 
-# -----------------------------
-# File and model helpers
-# -----------------------------
-
 def get_tree_csv_files() -> List[Path]:
     return sorted([
         file for file in DATA_DIR.glob("*.csv")
@@ -27,7 +23,6 @@ def get_installed_ollama_models() -> List[str]:
     try:
         response = ollama.list()
         raw_models = response.get("models", []) if isinstance(response, dict) else getattr(response, "models", [])
-
         names = []
         for model in raw_models:
             if isinstance(model, dict):
@@ -36,10 +31,11 @@ def get_installed_ollama_models() -> List[str]:
                 name = getattr(model, "model", None) or getattr(model, "name", None)
             if name:
                 names.append(name)
-
-        return sorted(names) if names else ["qwen2.5:3b", "llama3.1:8b"]
+        if names:
+            return sorted(set(names))
     except Exception:
-        return ["qwen2.5:3b", "llama3.1:8b"]
+        pass
+    return ["qwen2.5:3b", "qwen3.5:9b", "gpt-oss:20b"]
 
 
 @st.cache_data
@@ -47,9 +43,11 @@ def load_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-# -----------------------------
-# JSON and text helpers
-# -----------------------------
+def safe_string(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
 
 def extract_json(text: str) -> Optional[Dict[str, Any]]:
     try:
@@ -57,7 +55,6 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
         return parsed if isinstance(parsed, dict) else None
     except Exception:
         pass
-
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
@@ -66,7 +63,6 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
             return parsed if isinstance(parsed, dict) else None
         except Exception:
             return None
-
     return None
 
 
@@ -78,46 +74,12 @@ def split_questions(text: str) -> List[str]:
     return [part.strip() for part in parts if part.strip()]
 
 
-def safe_string(value: Any) -> str:
-    if pd.isna(value):
-        return ""
-    return str(value).strip()
-
-
-# -----------------------------
-# Dataset schema profiling
-# -----------------------------
-
-def build_column_profile(df: pd.DataFrame, max_examples: int = 5) -> List[Dict[str, Any]]:
-    profile = []
-    total = len(df)
-
-    for col in df.columns:
-        series = df[col]
-        non_null = int(series.notna().sum())
-        examples = [safe_string(x) for x in series.dropna().head(max_examples).tolist()]
-
-        numeric_series = pd.to_numeric(series, errors="coerce")
-        numeric_non_null = int(numeric_series.notna().sum())
-        numeric_ratio = round(numeric_non_null / total, 3) if total else 0
-
-        item = {
-            "name": col,
-            "dtype": str(series.dtype),
-            "non_null_count": non_null,
-            "non_null_ratio": round(non_null / total, 3) if total else 0,
-            "numeric_ratio": numeric_ratio,
-            "sample_values": examples,
-        }
-
-        if numeric_non_null > 0:
-            item["numeric_min"] = float(numeric_series.min())
-            item["numeric_max"] = float(numeric_series.max())
-            item["numeric_median"] = float(numeric_series.median())
-
-        profile.append(item)
-
-    return profile
+def column_exists(df: pd.DataFrame, options: List[str]) -> Optional[str]:
+    lower_to_original = {col.lower(): col for col in df.columns}
+    for option in options:
+        if option.lower() in lower_to_original:
+            return lower_to_original[option.lower()]
+    return None
 
 
 def score_column_name(col: str, positive_terms: List[str], negative_terms: Optional[List[str]] = None) -> int:
@@ -132,10 +94,10 @@ def score_column_name(col: str, positive_terms: List[str], negative_terms: Optio
     return score
 
 
-def best_text_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+def best_text_column(df: pd.DataFrame, candidates: List[str], negative_terms: Optional[List[str]] = None) -> Optional[str]:
     scored: List[Tuple[int, str]] = []
     for col in df.columns:
-        score = score_column_name(col, candidates)
+        score = score_column_name(col, candidates, negative_terms)
         if score <= 0:
             continue
         non_null = int(df[col].notna().sum())
@@ -156,9 +118,8 @@ def best_numeric_column(df: pd.DataFrame, candidates: List[str], negative_terms:
         numeric_count = int(numeric.notna().sum())
         if numeric_count == 0:
             continue
-        score += min(numeric_count, 1000) // 100
-        # Prefer primary fields such as DBH_1 over DBH_2.
         name = col.lower()
+        score += min(numeric_count, 1000) // 100
         if name.endswith("_1") or name.endswith("1"):
             score += 5
         if name.endswith("_2") or name.endswith("2"):
@@ -167,39 +128,9 @@ def best_numeric_column(df: pd.DataFrame, candidates: List[str], negative_terms:
     return sorted(scored, reverse=True)[0][1] if scored else None
 
 
-def validate_role_column(df: pd.DataFrame, role: str, col: Any) -> Optional[str]:
-    if col is None:
-        return None
-    col = str(col).strip()
-    if col.lower() in ["", "none", "null"]:
-        return None
-    if col not in df.columns:
-        return None
-
-    series = df[col]
-    name = col.lower()
-
-    if role in ["diameter_numeric", "height_numeric", "latitude", "longitude"]:
-        numeric_count = int(pd.to_numeric(series, errors="coerce").notna().sum())
-        return col if numeric_count > 0 else None
-
-    if role == "native_status":
-        values = " ".join(series.dropna().astype(str).head(200).str.lower().tolist())
-        name_ok = any(term in name for term in ["native", "origin", "introduced"])
-        value_ok = any(term in values for term in ["native", "introduced", "naturally", "occurring"])
-        return col if name_ok or value_ok else None
-
-    if role in ["species_common", "scientific_name", "condition", "danger_flag"]:
-        return col if int(series.notna().sum()) > 0 else None
-
-    return col
-
-
-def infer_schema_with_rules(df: pd.DataFrame) -> Dict[str, Optional[str]]:
-    columns = list(df.columns)
-    lower_to_original = {col.lower(): col for col in columns}
-
-    schema: Dict[str, Optional[str]] = {
+@st.cache_data(show_spinner=False)
+def infer_schema_rules_only(csv_name: str, df: pd.DataFrame) -> Dict[str, Any]:
+    roles: Dict[str, Optional[str]] = {
         "species_common": None,
         "scientific_name": None,
         "native_status": None,
@@ -213,194 +144,80 @@ def infer_schema_with_rules(df: pd.DataFrame) -> Dict[str, Optional[str]]:
         "id": None,
     }
 
-    # Direct exact-name wins.
-    exact_species = ["common_name", "common1", "common", "species", "spc_common"]
-    for name in exact_species:
-        if name in lower_to_original:
-            schema["species_common"] = lower_to_original[name]
-            break
+    roles["species_common"] = column_exists(df, ["common_name", "COMMON1", "COMMON", "species", "spc_common"])
+    if not roles["species_common"]:
+        roles["species_common"] = best_text_column(df, ["common", "species"], ["scientific", "sci"])
 
-    if schema["species_common"] is None:
-        schema["species_common"] = best_text_column(df, ["common", "species"])
+    roles["scientific_name"] = column_exists(df, ["scientific_name", "SCINAME1", "SCINAME", "latin_name"])
+    if not roles["scientific_name"]:
+        roles["scientific_name"] = best_text_column(df, ["scientific", "sciname", "sci", "latin"])
 
-    exact_sci = ["scientific_name", "sciname", "sciname1", "latin_name"]
-    for name in exact_sci:
-        if name in lower_to_original:
-            schema["scientific_name"] = lower_to_original[name]
-            break
+    roles["native_status"] = best_text_column(df, ["native", "origin", "introduced"])
 
-    if schema["scientific_name"] is None:
-        schema["scientific_name"] = best_text_column(df, ["scientific", "sci", "latin"])
+    roles["diameter_bin"] = best_text_column(df, ["diameter", "dbh", "breast_height", "bin", "class", "range"])
+    if roles["diameter_bin"]:
+        name = roles["diameter_bin"].lower()
+        if not any(term in name for term in ["bin", "class", "range"]):
+            roles["diameter_bin"] = None
 
-    schema["native_status"] = best_text_column(df, ["native", "origin", "introduced"])
+    roles["diameter_numeric"] = column_exists(df, ["DBH_1", "DBH", "diameter_breast_height_CM", "diameter"])
+    if roles["diameter_numeric"]:
+        if pd.to_numeric(df[roles["diameter_numeric"]], errors="coerce").notna().sum() == 0:
+            roles["diameter_numeric"] = None
+    if not roles["diameter_numeric"]:
+        roles["diameter_numeric"] = best_numeric_column(df, ["dbh", "diameter", "breast_height", "diam"], ["bin", "class", "range"])
 
-    # Prefer binned diameter columns for binned summaries.
-    schema["diameter_bin"] = best_text_column(df, ["diameter", "dbh", "breast_height", "bin", "class"])
-    if schema["diameter_bin"] is not None:
-        bin_name = schema["diameter_bin"].lower()
-        if not any(term in bin_name for term in ["bin", "class", "range"]):
-            schema["diameter_bin"] = None
+    roles["height_numeric"] = column_exists(df, ["TOTALHT1", "TOTALHT", "height_M", "height"])
+    if roles["height_numeric"]:
+        if pd.to_numeric(df[roles["height_numeric"]], errors="coerce").notna().sum() == 0:
+            roles["height_numeric"] = None
+    if not roles["height_numeric"]:
+        roles["height_numeric"] = best_numeric_column(df, ["height", "totalht", "total_ht", "ht"])
 
-    schema["diameter_numeric"] = best_numeric_column(
-        df,
-        ["dbh", "diameter", "breast_height", "diam"],
-        negative_terms=["bin", "class", "range"],
-    )
+    roles["latitude"] = column_exists(df, ["latitude_coordinate", "latitude", "LAT", "lat", "y"])
+    roles["longitude"] = column_exists(df, ["longitude_coordinate", "longitude", "LONG", "long", "lon", "lng", "x"])
+    if not roles["latitude"]:
+        roles["latitude"] = best_numeric_column(df, ["latitude", "lat", "northing", "y"])
+    if not roles["longitude"]:
+        roles["longitude"] = best_numeric_column(df, ["longitude", "long", "lon", "lng", "easting", "x"])
 
-    schema["height_numeric"] = best_numeric_column(df, ["height", "totalht", "total_ht", "ht"])
+    roles["condition"] = best_text_column(df, ["condition", "health", "status"])
+    roles["danger_flag"] = column_exists(df, ["IsDANGER", "danger", "hazard", "risk"])
+    if not roles["danger_flag"]:
+        roles["danger_flag"] = best_numeric_column(df, ["danger", "hazard", "risk"])
+    roles["id"] = best_text_column(df, ["tree_id", "objectid", "fid", "id"])
 
-    # Latitude/longitude. This supports both decimal degrees and projected x/y mislabeled as lat/long.
-    lat_exact = ["latitude_coordinate", "latitude", "lat", "y"]
-    lon_exact = ["longitude_coordinate", "longitude", "long", "lon", "lng", "x"]
+    coordinate_kind = classify_coordinates(df, roles.get("latitude"), roles.get("longitude"))
+    return {"roles": roles, "coordinate_kind": coordinate_kind, "schema_method": "rules_only"}
 
-    for name in lat_exact:
-        if name in lower_to_original:
-            schema["latitude"] = lower_to_original[name]
-            break
-    for name in lon_exact:
-        if name in lower_to_original:
-            schema["longitude"] = lower_to_original[name]
-            break
-
-    if schema["latitude"] is None:
-        schema["latitude"] = best_numeric_column(df, ["latitude", "lat", "northing", "y"])
-    if schema["longitude"] is None:
-        schema["longitude"] = best_numeric_column(df, ["longitude", "long", "lon", "lng", "easting", "x"])
-
-    schema["condition"] = best_text_column(df, ["condition", "health", "status"])
-    schema["danger_flag"] = best_numeric_column(df, ["danger", "hazard", "risk"])
-    schema["id"] = best_text_column(df, ["tree_id", "objectid", "fid", "id"])
-
-    # Final validation.
-    for role, col in list(schema.items()):
-        schema[role] = validate_role_column(df, role, col)
-
-    return schema
-
-
-@st.cache_data(show_spinner=False)
-def ask_model_to_infer_schema(csv_name: str, profile_json: str, model_name: str) -> Dict[str, Optional[str]]:
-    prompt = f"""
-You are identifying the semantic roles of columns in a tree inventory CSV.
-
-CSV file name: {csv_name}
-
-Column profile JSON:
-{profile_json}
-
-Return only valid JSON with this exact structure:
-{{
-  "species_common": null,
-  "scientific_name": null,
-  "native_status": null,
-  "diameter_numeric": null,
-  "diameter_bin": null,
-  "height_numeric": null,
-  "latitude": null,
-  "longitude": null,
-  "condition": null,
-  "danger_flag": null,
-  "id": null
-}}
-
-Rules:
-- Use column names exactly as shown in the profile.
-- COMMON1, COMMON2, common_name, or similar usually mean common species name.
-- SCINAME1, scientific_name, or similar usually mean scientific species name.
-- DBH, diameter, or diameter_breast_height usually means tree diameter.
-- TOTALHT or height usually means tree height.
-- LAT/LONG, latitude/longitude, northing/easting, x/y can be coordinate fields.
-- If a role is not present in the CSV, return null for that role.
-- Do not guess native_status unless a column clearly stores native/origin/introduced values.
-"""
-    try:
-        response = ollama.chat(model=model_name, messages=[{"role": "user", "content": prompt}])
-        parsed = extract_json(response["message"]["content"].strip())
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
-
-
-def infer_schema(df: pd.DataFrame, csv_name: str, model_name: str) -> Dict[str, Any]:
-    rules = infer_schema_with_rules(df)
-    profile = build_column_profile(df)
-    compact_profile = json.dumps(profile[:80], indent=2)
-    model_guess = ask_model_to_infer_schema(csv_name, compact_profile, model_name)
-
-    merged = dict(rules)
-    for role in merged.keys():
-        model_col = validate_role_column(df, role, model_guess.get(role)) if isinstance(model_guess, dict) else None
-        if model_col:
-            merged[role] = model_col
-
-    coordinate_kind = classify_coordinates(df, merged.get("latitude"), merged.get("longitude"))
-
-    return {
-        "roles": merged,
-        "coordinate_kind": coordinate_kind,
-        "model_guess": model_guess,
-        "rule_guess": rules,
-    }
-
-
-# -----------------------------
-# Coordinate handling
-# -----------------------------
 
 def classify_coordinates(df: pd.DataFrame, lat_col: Optional[str], lon_col: Optional[str]) -> str:
     if not lat_col or not lon_col:
         return "none"
-
     lat = pd.to_numeric(df[lat_col], errors="coerce")
     lon = pd.to_numeric(df[lon_col], errors="coerce")
     valid = lat.notna() & lon.notna()
     if int(valid.sum()) == 0:
         return "none"
-
     lat_med = float(lat[valid].median())
     lon_med = float(lon[valid].median())
-
     if -90 <= lat_med <= 90 and -180 <= lon_med <= 180:
         return "decimal_degrees"
-
-    # UGA example: LAT around 3,759,000 and LONG around 280,500.
-    # Those values look like UTM Zone 17N northing/easting, not decimal lat/lon.
-    if 100000 <= lon_med <= 900000 and 0 <= lat_med <= 10000000:
-        return "projected_possible_utm17n"
-
-    return "projected_unknown"
+    return "projected_crs_required"
 
 
 def get_map_coordinates(df: pd.DataFrame, lat_col: str, lon_col: str, coordinate_kind: str) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[str]]:
     raw_lat = pd.to_numeric(df[lat_col], errors="coerce")
     raw_lon = pd.to_numeric(df[lon_col], errors="coerce")
-
     if coordinate_kind == "decimal_degrees":
         return raw_lat, raw_lon, None
-
-    if coordinate_kind == "projected_possible_utm17n":
-        try:
-            from pyproj import Transformer
-        except Exception:
-            return None, None, "Coordinates are present, but they look projected rather than decimal latitude/longitude. Install pyproj with: pip install pyproj"
-
-        try:
-            transformer = Transformer.from_crs("EPSG:32617", "EPSG:4326", always_xy=True)
-            # LONG is the easting/x field, LAT is the northing/y field in the UGA-style file.
-            lon_values, lat_values = transformer.transform(raw_lon.to_numpy(), raw_lat.to_numpy())
-            return pd.Series(lat_values, index=df.index), pd.Series(lon_values, index=df.index), None
-        except Exception as exc:
-            return None, None, f"Coordinate transformation failed: {exc}"
-
-    if coordinate_kind == "projected_unknown":
-        return None, None, "Coordinates are present, but they are not decimal degrees and the coordinate reference system is unknown."
-
+    if coordinate_kind == "projected_crs_required":
+        return None, None, (
+            "Coordinate fields were found, but they are projected coordinates rather than normal decimal latitude/longitude. "
+            "To map them accurately, provide the source CRS from ArcGIS, the .prj file, or an EPSG/WKID code."
+        )
     return None, None, "No usable coordinates were found."
 
-
-# -----------------------------
-# Question interpretation
-# -----------------------------
 
 def blank_instructions() -> Dict[str, Any]:
     return {
@@ -441,7 +258,6 @@ def parse_with_rules(question: str) -> Dict[str, Any]:
         "oak", "pine", "palm", "maple", "elm", "magnolia", "crapemyrtle",
         "cypress", "cedar", "holly", "palmetto", "dogwood", "poplar", "birch",
     ]
-
     for word in sorted(species_words, key=len, reverse=True):
         if word in q:
             instructions["species_text"] = word
@@ -469,20 +285,18 @@ def parse_with_rules(question: str) -> Dict[str, Any]:
         instructions["max_diameter"] = float(less_than.group(1))
         if instructions["intent"] == "summary":
             instructions["intent"] = "filter"
-
     return instructions
 
 
 def ask_model_for_parse(question: str, schema: Dict[str, Any], model_name: str) -> Dict[str, Any]:
     prompt = f"""
-You are converting a tree-data question into structured JSON instructions.
+Return only valid JSON. Do not include reasoning, markdown, or extra text.
+If you have a thinking mode, do not use it.
 
-Detected dataset schema:
+Detected tree dataset roles:
 {json.dumps(schema["roles"], indent=2)}
 
-Return only valid JSON. Do not include markdown.
-
-Use this exact structure:
+Convert the question into this exact JSON structure:
 {{
   "intent": "summary",
   "species_text": null,
@@ -494,25 +308,24 @@ Use this exact structure:
   "limit": 1000
 }}
 
-Intent must be one of:
-summary, count, top_species, native_summary, diameter_summary, danger_summary, filter, map
+Intent must be one of: summary, count, top_species, native_summary, diameter_summary, danger_summary, filter, map.
+Use intent count for "how many" questions.
+Use intent top_species for most common species.
+Use intent native_summary for native/introduced questions.
+Use intent diameter_summary for diameter/DBH/bin questions.
+Use intent danger_summary and danger_value 1 for danger/hazard questions.
+Use intent map and make_map true for map/location questions.
+For species groups like oak, pine, dogwood, maple, magnolia, put the word in species_text.
+For native trees, set native_text to naturally_occurring.
 
-Rules:
-- For "how many", use intent "count".
-- For top or most common species, use intent "top_species".
-- For native/introduced questions, use intent "native_summary".
-- For diameter/DBH/size/bin questions, use intent "diameter_summary".
-- For danger/hazard questions, use intent "danger_summary" and danger_value 1.
-- For map/plot/geographic/location questions, use intent "map" and make_map true.
-- If the user asks about a species group like oak, pine, dogwood, maple, magnolia, etc., put that word in species_text.
-- If the user asks for native trees, set native_text to "naturally_occurring".
-- Do not invent data fields.
-
-Question:
-{question}
+Question: {question}
 """
     try:
-        response = ollama.chat(model=model_name, messages=[{"role": "user", "content": prompt}])
+        response = ollama.chat(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0, "num_predict": 180},
+        )
         parsed = extract_json(response["message"]["content"].strip())
         return parsed if isinstance(parsed, dict) else blank_instructions()
     except Exception:
@@ -527,41 +340,33 @@ def clean_instruction_value(value: Any) -> Any:
     return value
 
 
-def interpret_question(question: str, schema: Dict[str, Any], model_name: str) -> Dict[str, Any]:
-    model_instructions = ask_model_for_parse(question, schema, model_name)
+def interpret_question(question: str, schema: Dict[str, Any], model_name: str, use_model_parse: bool) -> Dict[str, Any]:
     rule_instructions = parse_with_rules(question)
+    model_instructions = ask_model_for_parse(question, schema, model_name) if use_model_parse else blank_instructions()
 
     allowed_intents = {"summary", "count", "top_species", "native_summary", "diameter_summary", "danger_summary", "filter", "map"}
     merged = blank_instructions()
     merged.update(model_instructions or {})
-
     if merged.get("intent") not in allowed_intents:
         merged["intent"] = "summary"
 
     for key in ["species_text", "native_text", "min_diameter", "max_diameter", "danger_value"]:
         merged[key] = clean_instruction_value(merged.get(key))
-
     try:
         merged["limit"] = int(merged.get("limit") or 1000)
     except Exception:
         merged["limit"] = 1000
 
-    # Deterministic parsing fixes obvious misses from small local models.
+    # Deterministic parsing overrides obvious misses. This makes the demo stable.
     for key in ["species_text", "native_text", "min_diameter", "max_diameter", "danger_value"]:
         if rule_instructions.get(key) is not None:
             merged[key] = rule_instructions[key]
-
     if rule_instructions.get("intent") != "summary":
         merged["intent"] = rule_instructions["intent"]
     if rule_instructions.get("make_map"):
         merged["make_map"] = True
-
     return merged
 
-
-# -----------------------------
-# Query execution and summaries
-# -----------------------------
 
 def apply_filters(df: pd.DataFrame, schema: Dict[str, Any], instructions: Dict[str, Any]) -> Tuple[pd.DataFrame, List[str], List[str]]:
     roles = schema["roles"]
@@ -571,7 +376,6 @@ def apply_filters(df: pd.DataFrame, schema: Dict[str, Any], instructions: Dict[s
 
     species_cols = [roles.get("species_common"), roles.get("scientific_name")]
     species_cols = [col for col in species_cols if col]
-
     if instructions.get("species_text"):
         if species_cols:
             mask = pd.Series(False, index=filtered.index)
@@ -614,7 +418,6 @@ def apply_filters(df: pd.DataFrame, schema: Dict[str, Any], instructions: Dict[s
 
     if not filters:
         filters.append("No filters applied")
-
     return filtered, filters, warnings
 
 
@@ -622,7 +425,6 @@ def make_diameter_table(df: pd.DataFrame, schema: Dict[str, Any]) -> Tuple[Optio
     roles = schema["roles"]
     bin_col = roles.get("diameter_bin")
     numeric_col = roles.get("diameter_numeric")
-
     if bin_col:
         table = df[bin_col].astype(str).value_counts().reset_index()
         table.columns = ["Diameter bin", "Count"]
@@ -631,31 +433,21 @@ def make_diameter_table(df: pd.DataFrame, schema: Dict[str, Any]) -> Tuple[Optio
         else:
             summary = "No diameter-bin values were found."
         return table, summary
-
     if numeric_col:
         values = pd.to_numeric(df[numeric_col], errors="coerce").dropna()
         if len(values) == 0:
             return None, "The detected diameter column has no numeric values."
-
-        max_value = float(values.max())
-        if max_value <= 100:
-            bins = [-0.001, 5, 10, 20, 30, 40, 50, float("inf")]
-            labels = ["0 to 5", "5 to 10", "10 to 20", "20 to 30", "30 to 40", "40 to 50", "more than 50"]
-        else:
-            bins = 6
-            labels = None
-
+        bins = [-0.001, 5, 10, 20, 30, 40, 50, float("inf")]
+        labels = ["0 to 5", "5 to 10", "10 to 20", "20 to 30", "30 to 40", "40 to 50", "more than 50"]
         cut = pd.cut(values, bins=bins, labels=labels, include_lowest=True)
         table = cut.value_counts().sort_index().reset_index()
         table.columns = ["Diameter/DBH range", "Count"]
         table["Diameter/DBH range"] = table["Diameter/DBH range"].astype(str)
-
         summary = (
             f"This CSV does not have a pre-binned diameter field, so I binned the numeric {numeric_col} field. "
             f"The median {numeric_col} value is {values.median():.1f}, and the maximum is {values.max():.1f}."
         )
         return table, summary
-
     return None, "I could not find a diameter/DBH column in this CSV."
 
 
@@ -674,10 +466,8 @@ def build_result(
     matching_rows = len(filtered_df)
     percent = round((matching_rows / total_rows) * 100, 1) if total_rows else 0.0
     intent = instructions.get("intent", "summary")
-
     table_df: Optional[pd.DataFrame] = None
     preview_df: Optional[pd.DataFrame] = None
-    verified_summary = ""
     result_available = True
 
     if warnings and any("native-status" in w for w in warnings) and intent == "native_summary":
@@ -687,7 +477,6 @@ def build_result(
             {"Item": "Rows in dataset", "Result": f"{total_rows:,}"},
         ])
         verified_summary = "This CSV does not contain a recognized native-status column, so I cannot determine which records are native trees from this file."
-
     elif intent == "top_species" and roles.get("species_common"):
         species_col = roles["species_common"]
         table_df = filtered_df[species_col].astype(str).value_counts().head(10).reset_index()
@@ -700,32 +489,22 @@ def build_result(
             )
         else:
             verified_summary = "No matching species records were found."
-
     elif intent == "native_summary" and roles.get("native_status"):
         native_col = roles["native_status"]
         table_df = filtered_df[native_col].astype(str).value_counts().reset_index()
         table_df.columns = ["Native status", "Count"]
-        verified_summary = (
-            f"There are {matching_rows:,} matching tree records, which is {percent}% of the full dataset. "
-            f"The filters used were: {'; '.join(filters)}."
-        )
-
+        verified_summary = f"There are {matching_rows:,} matching tree records, which is {percent}% of the full dataset. The filters used were: {'; '.join(filters)}."
     elif intent == "diameter_summary":
         table_df, diameter_summary = make_diameter_table(filtered_df, schema)
         if table_df is None:
             result_available = False
             table_df = pd.DataFrame([{"Item": "Diameter/DBH column", "Result": "Not found or not usable"}])
         verified_summary = diameter_summary + f" The summary is based on {matching_rows:,} matching records out of {total_rows:,} total records."
-
     elif intent == "danger_summary" and roles.get("danger_flag"):
         danger_col = roles["danger_flag"]
         table_df = filtered_df[danger_col].astype(str).value_counts().reset_index()
         table_df.columns = ["Danger flag", "Count"]
-        verified_summary = (
-            f"The danger/hazard summary used the {danger_col} field. "
-            f"There are {matching_rows:,} matching records out of {total_rows:,} total records."
-        )
-
+        verified_summary = f"The danger/hazard summary used the {danger_col} field. There are {matching_rows:,} matching records out of {total_rows:,} total records."
     else:
         table_df = pd.DataFrame([
             {"Metric": "Matching records", "Value": f"{matching_rows:,}"},
@@ -734,14 +513,10 @@ def build_result(
             {"Metric": "Filters used", "Value": "; ".join(filters)},
         ])
         preview_df = filtered_df.head(int(instructions.get("limit", 1000))) if matching_rows > 0 else None
-        verified_summary = (
-            f"There are {matching_rows:,} matching tree records, which is {percent}% of the full dataset. "
-            f"The filters used were: {'; '.join(filters)}."
-        )
+        verified_summary = f"There are {matching_rows:,} matching tree records, which is {percent}% of the full dataset. The filters used were: {'; '.join(filters)}."
 
     if warnings:
         verified_summary += " " + " ".join(warnings)
-
     if instructions.get("make_map") and coord_rows == 0:
         verified_summary += " A map was requested, but this CSV has no usable coordinate values."
 
@@ -760,11 +535,13 @@ def build_result(
         "coordinate_rows_in_dataset": int(coord_rows),
         "coordinate_kind": schema.get("coordinate_kind"),
     }
-
     return table_df, preview_df, payload
 
 
-def explain_result(payload: Dict[str, Any], model_name: str) -> str:
+def explain_result(payload: Dict[str, Any], model_name: str, use_model_explanation: bool) -> str:
+    if not use_model_explanation:
+        return payload["verified_summary"]
+
     user_facing_payload = {
         "question": payload["question"],
         "result_available": payload["result_available"],
@@ -776,7 +553,6 @@ def explain_result(payload: Dict[str, Any], model_name: str) -> str:
         "verified_summary": payload["verified_summary"],
         "important_table": payload["important_table"],
     }
-
     if payload.get("map_requested"):
         user_facing_payload["map_note"] = (
             f"A map was requested. Coordinate rows available: {payload['coordinate_rows_in_dataset']}. "
@@ -784,43 +560,34 @@ def explain_result(payload: Dict[str, Any], model_name: str) -> str:
         )
 
     prompt = f"""
-You are explaining a tree CSV analysis result to a nontechnical supervisor.
-
-Use only the verified facts below.
-Do not invent facts.
-Do not recalculate numbers.
-Do not mention JSON, internal fields, map_requested, or coordinate details unless map_note is present.
-Do not say "forest surveyed"; say "CSV dataset" or "tree dataset".
-Write 2 to 4 plain-English sentences.
+Use only the verified facts below. Write 2 to 4 plain-English sentences for a nontechnical supervisor.
+Do not invent facts. Do not recalculate numbers. Do not mention JSON or internal fields.
+Do not mention coordinate details unless map_note is present.
 
 Verified facts:
 {json.dumps(user_facing_payload, indent=2)}
 """
     try:
-        response = ollama.chat(model=model_name, messages=[{"role": "user", "content": prompt}])
+        response = ollama.chat(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0, "num_predict": 220},
+        )
         text = response["message"]["content"].strip()
         lowered = text.lower()
-
         forbidden = ["over 99%", "almost all", "forest surveyed", "map_requested", "json"]
         if not payload.get("map_requested"):
             forbidden.extend(["coordinate data", "coordinate rows", "missing coordinate"])
-
         if any(term in lowered for term in forbidden):
             return payload["verified_summary"]
-
         if payload.get("result_available"):
             count_text = str(payload["matching_record_count"])
             if count_text not in text.replace(",", ""):
                 return payload["verified_summary"]
-
         return text
     except Exception:
         return payload["verified_summary"]
 
-
-# -----------------------------
-# Map creation
-# -----------------------------
 
 def make_map(df: pd.DataFrame, schema: Dict[str, Any], popup_cols: List[Optional[str]]) -> Tuple[Optional[folium.Map], Optional[str]]:
     roles = schema["roles"]
@@ -828,49 +595,36 @@ def make_map(df: pd.DataFrame, schema: Dict[str, Any], popup_cols: List[Optional
     lon_col = roles.get("longitude")
     if not lat_col or not lon_col:
         return None, "No coordinate columns were detected."
-
     map_df = df.dropna(subset=[lat_col, lon_col]).copy()
     if len(map_df) == 0:
         return None, "No rows have usable coordinate values."
-
     if len(map_df) > 1000:
         map_df = map_df.sample(1000, random_state=42)
-
     lat_values, lon_values, error = get_map_coordinates(map_df, lat_col, lon_col, schema.get("coordinate_kind", "none"))
     if error:
         return None, error
     if lat_values is None or lon_values is None:
         return None, "Could not prepare coordinates for mapping."
-
     map_df = map_df.copy()
     map_df["__map_lat"] = lat_values
     map_df["__map_lon"] = lon_values
     map_df = map_df.dropna(subset=["__map_lat", "__map_lon"])
-
     if len(map_df) == 0:
         return None, "No valid coordinates remained after conversion."
-
     m = folium.Map(location=[map_df["__map_lat"].mean(), map_df["__map_lon"].mean()], zoom_start=16)
-
     for _, row in map_df.iterrows():
         popup_text = []
         for col in popup_cols:
             if col and col in row:
                 popup_text.append(f"{col}: {row[col]}")
-
         folium.CircleMarker(
             location=[row["__map_lat"], row["__map_lon"]],
             radius=3,
             popup="<br>".join(popup_text),
             fill=True,
         ).add_to(m)
-
     return m, None
 
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
 
 st.set_page_config(page_title="Tree AI Demo", layout="wide")
 st.title("Tree AI Demo")
@@ -885,12 +639,19 @@ csv_choice = st.sidebar.selectbox("Choose tree CSV", csv_files, format_func=lamb
 df = load_csv(csv_choice)
 
 models = get_installed_ollama_models()
-default_index = models.index("qwen2.5:3b") if "qwen2.5:3b" in models else 0
+preferred_order = ["qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b", "qwen2.5:3b"]
+default_index = 0
+for preferred in preferred_order:
+    if preferred in models:
+        default_index = models.index(preferred)
+        break
+
 st.sidebar.header("AI model")
 model_name = st.sidebar.selectbox("Ollama model", models, index=default_index)
+use_model_parse = st.sidebar.checkbox("Use model for question interpretation", value=True)
+use_model_explanation = st.sidebar.checkbox("Use model for explanation", value=True)
 
-with st.spinner("Interpreting dataset schema..."):
-    schema = infer_schema(df, csv_choice.name, model_name)
+schema = infer_schema_rules_only(csv_choice.name, df)
 roles = schema["roles"]
 
 coord_rows = 0
@@ -907,6 +668,9 @@ c4.metric("Coordinate type", schema.get("coordinate_kind", "none"))
 with st.expander("Preview data"):
     st.dataframe(df.head(25))
 
+with st.expander("Detected dataset roles"):
+    st.json(roles)
+
 st.subheader("Ask a question")
 question_text = st.text_area(
     "Ask one or more questions. Separate multiple questions with punctuation.",
@@ -919,49 +683,43 @@ if st.button("Run"):
     if not questions:
         st.warning("Please enter a question.")
         st.stop()
-
     for question in questions:
         st.divider()
         st.subheader(f"Question: {question}")
-
-        instructions = interpret_question(question, schema, model_name)
-        filtered_df, filters, warnings = apply_filters(df, schema, instructions)
-        table_df, preview_df, payload = build_result(
-            df=df,
-            filtered_df=filtered_df,
-            question=question,
-            instructions=instructions,
-            schema=schema,
-            filters=filters,
-            warnings=warnings,
-            coord_rows=coord_rows,
-        )
+        with st.spinner("Interpreting question and querying data..."):
+            instructions = interpret_question(question, schema, model_name, use_model_parse)
+            filtered_df, filters, warnings = apply_filters(df, schema, instructions)
+            table_df, preview_df, payload = build_result(
+                df=df,
+                filtered_df=filtered_df,
+                question=question,
+                instructions=instructions,
+                schema=schema,
+                filters=filters,
+                warnings=warnings,
+                coord_rows=coord_rows,
+            )
+            explanation = explain_result(payload, model_name, use_model_explanation)
 
         with st.expander("AI interpretation"):
             st.write("Question interpretation")
             st.json(instructions)
-            st.write("Automatically detected dataset roles")
+            st.write("Detected dataset roles")
             st.json(roles)
-            if schema.get("model_guess"):
-                st.write("Model schema guess before validation")
-                st.json(schema.get("model_guess"))
 
         st.markdown("### Plain-English answer")
-        st.write(explain_result(payload, model_name))
+        st.write(explanation)
 
         st.markdown("### Data result")
         if payload.get("result_available"):
             st.write(f"Matching records: {len(filtered_df):,}")
         else:
             st.write("Matching records: not applicable")
-
         if table_df is not None:
             st.dataframe(table_df)
-
         if preview_df is not None:
             with st.expander("Preview matching rows"):
                 st.dataframe(preview_df)
-
         if instructions.get("make_map") or instructions.get("intent") == "map":
             st.markdown("### Map")
             popup_cols = [roles.get("species_common"), roles.get("scientific_name"), roles.get("diameter_numeric"), roles.get("height_numeric")]
