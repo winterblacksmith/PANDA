@@ -12,6 +12,10 @@ from streamlit_folium import st_folium
 DATA_DIR = Path("data")
 
 
+# -----------------------------
+# File and model helpers
+# -----------------------------
+
 def get_tree_csv_files() -> List[Path]:
     return sorted([
         file for file in DATA_DIR.glob("*.csv")
@@ -42,6 +46,10 @@ def get_installed_ollama_models() -> List[str]:
 def load_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
+
+# -----------------------------
+# Generic helpers
+# -----------------------------
 
 def safe_string(value: Any) -> str:
     if pd.isna(value):
@@ -81,6 +89,10 @@ def column_exists(df: pd.DataFrame, options: List[str]) -> Optional[str]:
             return lower_to_original[option.lower()]
     return None
 
+
+# -----------------------------
+# Schema detection: rules first, optional AI refinement
+# -----------------------------
 
 def score_column_name(col: str, positive_terms: List[str], negative_terms: Optional[List[str]] = None) -> int:
     name = col.lower().replace(" ", "_")
@@ -191,6 +203,139 @@ def infer_schema_rules_only(csv_name: str, df: pd.DataFrame) -> Dict[str, Any]:
     return {"roles": roles, "coordinate_kind": coordinate_kind, "schema_method": "rules_only"}
 
 
+def build_column_profile(df: pd.DataFrame, max_examples: int = 6, max_columns: int = 80) -> List[Dict[str, Any]]:
+    profile: List[Dict[str, Any]] = []
+    total = len(df)
+
+    for col in list(df.columns)[:max_columns]:
+        series = df[col]
+        numeric = pd.to_numeric(series, errors="coerce")
+        non_null = int(series.notna().sum())
+        numeric_non_null = int(numeric.notna().sum())
+        examples = [safe_string(x) for x in series.dropna().head(max_examples).tolist()]
+
+        item: Dict[str, Any] = {
+            "name": col,
+            "dtype": str(series.dtype),
+            "non_null_count": non_null,
+            "non_null_ratio": round(non_null / total, 3) if total else 0,
+            "numeric_ratio": round(numeric_non_null / total, 3) if total else 0,
+            "sample_values": examples,
+        }
+        if numeric_non_null > 0:
+            item["numeric_min"] = float(numeric.min())
+            item["numeric_max"] = float(numeric.max())
+            item["numeric_median"] = float(numeric.median())
+        else:
+            value_counts = series.dropna().astype(str).value_counts().head(5)
+            item["top_values"] = value_counts.to_dict()
+        profile.append(item)
+    return profile
+
+
+def validate_ai_role(df: pd.DataFrame, role: str, col: Any) -> Optional[str]:
+    if col is None:
+        return None
+    col = str(col).strip()
+    if col.lower() in ["", "none", "null"]:
+        return None
+    if col not in df.columns:
+        return None
+
+    series = df[col]
+    name = col.lower()
+
+    if role in ["diameter_numeric", "height_numeric", "latitude", "longitude"]:
+        numeric_count = int(pd.to_numeric(series, errors="coerce").notna().sum())
+        return col if numeric_count > 0 else None
+
+    if role == "native_status":
+        values = " ".join(series.dropna().astype(str).head(300).str.lower().tolist())
+        name_ok = any(term in name for term in ["native", "origin", "introduced"])
+        value_ok = any(term in values for term in ["native", "introduced", "naturally", "occurring", "non-native"])
+        return col if name_ok or value_ok else None
+
+    if role == "danger_flag":
+        name_ok = any(term in name for term in ["danger", "hazard", "risk"])
+        values = set(series.dropna().astype(str).str.lower().head(50).tolist())
+        flag_like = values.issubset({"0", "1", "0.0", "1.0", "true", "false", "yes", "no"}) if values else False
+        return col if name_ok or flag_like else None
+
+    if role in ["species_common", "scientific_name", "condition", "id", "diameter_bin"]:
+        return col if int(series.notna().sum()) > 0 else None
+
+    return col
+
+
+@st.cache_data(show_spinner=False)
+def ask_ai_to_refine_schema(csv_name: str, profile_json: str, rule_roles_json: str, model_name: str) -> Dict[str, Any]:
+    prompt = f"""
+You are reviewing a tree inventory CSV schema.
+
+CSV file: {csv_name}
+
+Rule-based schema guess:
+{rule_roles_json}
+
+Column profile:
+{profile_json}
+
+Return only valid JSON. Do not include markdown, reasoning, or extra text.
+Use this exact structure:
+{{
+  "species_common": null,
+  "scientific_name": null,
+  "native_status": null,
+  "diameter_numeric": null,
+  "diameter_bin": null,
+  "height_numeric": null,
+  "latitude": null,
+  "longitude": null,
+  "condition": null,
+  "danger_flag": null,
+  "id": null
+}}
+
+Rules:
+- Use exact column names from the profile.
+- Return null if a role is not present.
+- Do not guess native_status unless a column clearly stores native/origin/introduced values.
+- COMMON/common_name/species-like columns usually mean common species name.
+- SCINAME/scientific/latin-like columns usually mean scientific name.
+- DBH/diameter-like numeric columns usually mean diameter.
+- TOTALHT/height-like numeric columns usually mean height.
+- LAT/LONG/X/Y/northing/easting-like numeric columns can be coordinate fields.
+- IsDANGER/danger/hazard/risk-like fields can be danger flags.
+"""
+    try:
+        response = ollama.chat(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0, "num_predict": 350},
+        )
+        parsed = extract_json(response["message"]["content"].strip())
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def merge_ai_schema(df: pd.DataFrame, base_schema: Dict[str, Any], ai_guess: Dict[str, Any], model_name: str) -> Dict[str, Any]:
+    roles = dict(base_schema["roles"])
+    for role in roles.keys():
+        proposed = validate_ai_role(df, role, ai_guess.get(role)) if isinstance(ai_guess, dict) else None
+        if proposed:
+            roles[role] = proposed
+
+    coordinate_kind = classify_coordinates(df, roles.get("latitude"), roles.get("longitude"))
+    return {
+        "roles": roles,
+        "coordinate_kind": coordinate_kind,
+        "schema_method": f"ai_refined_with_{model_name}",
+        "ai_schema_guess": ai_guess,
+        "rule_schema_guess": base_schema["roles"],
+    }
+
+
 def classify_coordinates(df: pd.DataFrame, lat_col: Optional[str], lon_col: Optional[str]) -> str:
     if not lat_col or not lon_col:
         return "none"
@@ -218,6 +363,10 @@ def get_map_coordinates(df: pd.DataFrame, lat_col: str, lon_col: str, coordinate
         )
     return None, None, "No usable coordinates were found."
 
+
+# -----------------------------
+# Question interpretation
+# -----------------------------
 
 def blank_instructions() -> Dict[str, Any]:
     return {
@@ -357,7 +506,6 @@ def interpret_question(question: str, schema: Dict[str, Any], model_name: str, u
     except Exception:
         merged["limit"] = 1000
 
-    # Deterministic parsing overrides obvious misses. This makes the demo stable.
     for key in ["species_text", "native_text", "min_diameter", "max_diameter", "danger_value"]:
         if rule_instructions.get(key) is not None:
             merged[key] = rule_instructions[key]
@@ -367,6 +515,10 @@ def interpret_question(question: str, schema: Dict[str, Any], model_name: str, u
         merged["make_map"] = True
     return merged
 
+
+# -----------------------------
+# Query execution and summaries
+# -----------------------------
 
 def apply_filters(df: pd.DataFrame, schema: Dict[str, Any], instructions: Dict[str, Any]) -> Tuple[pd.DataFrame, List[str], List[str]]:
     roles = schema["roles"]
@@ -626,6 +778,10 @@ def make_map(df: pd.DataFrame, schema: Dict[str, Any], popup_cols: List[Optional
     return m, None
 
 
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+
 st.set_page_config(page_title="Tree AI Demo", layout="wide")
 st.title("Tree AI Demo")
 st.write("This demo uses a local AI model to interpret questions, query a tree CSV, and explain the results.")
@@ -647,11 +803,32 @@ for preferred in preferred_order:
         break
 
 st.sidebar.header("AI model")
-model_name = st.sidebar.selectbox("Ollama model", models, index=default_index)
+model_name = st.sidebar.selectbox("Question/explanation model", models, index=default_index)
+schema_model_name = st.sidebar.selectbox("Schema refinement model", models, index=default_index)
 use_model_parse = st.sidebar.checkbox("Use model for question interpretation", value=True)
 use_model_explanation = st.sidebar.checkbox("Use model for explanation", value=True)
 
-schema = infer_schema_rules_only(csv_choice.name, df)
+base_schema = infer_schema_rules_only(csv_choice.name, df)
+schema_key = f"schema::{csv_choice.name}"
+if schema_key not in st.session_state:
+    st.session_state[schema_key] = base_schema
+
+st.sidebar.header("Schema")
+if st.sidebar.button("Refine schema with AI"):
+    with st.spinner(f"Refining schema with {schema_model_name}..."):
+        profile = build_column_profile(df)
+        ai_guess = ask_ai_to_refine_schema(
+            csv_choice.name,
+            json.dumps(profile, indent=2),
+            json.dumps(base_schema["roles"], indent=2),
+            schema_model_name,
+        )
+        st.session_state[schema_key] = merge_ai_schema(df, base_schema, ai_guess, schema_model_name)
+
+if st.sidebar.button("Reset schema to rules"):
+    st.session_state[schema_key] = base_schema
+
+schema = st.session_state[schema_key]
 roles = schema["roles"]
 
 coord_rows = 0
@@ -669,7 +846,14 @@ with st.expander("Preview data"):
     st.dataframe(df.head(25))
 
 with st.expander("Detected dataset roles"):
+    st.write(f"Schema method: {schema.get('schema_method', 'unknown')}")
     st.json(roles)
+    if schema.get("ai_schema_guess"):
+        st.write("AI schema guess before validation")
+        st.json(schema.get("ai_schema_guess"))
+    if schema.get("rule_schema_guess"):
+        st.write("Rule-based schema guess")
+        st.json(schema.get("rule_schema_guess"))
 
 st.subheader("Ask a question")
 question_text = st.text_area(
