@@ -3,6 +3,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
+from uuid import uuid4
 
 import folium
 import ollama
@@ -63,6 +64,10 @@ def safe_string(value: Any) -> str:
     return str(value).strip()
 
 
+def normalize_prompt(text: str) -> str:
+    return text.strip().rstrip("\\").strip()
+
+
 def extract_json(text: str) -> Optional[Dict[str, Any]]:
     try:
         parsed = json.loads(text)
@@ -84,13 +89,12 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
 
 
 def split_questions(text: str) -> List[str]:
-    text = text.strip()
-
+    text = normalize_prompt(text)
     if not text:
         return []
 
     parts = re.split(r"(?<=[?.!])\s+", text)
-    return [part.strip() for part in parts if part.strip()]
+    return [normalize_prompt(part) for part in parts if normalize_prompt(part)]
 
 
 def column_exists(df: pd.DataFrame, options: List[str]) -> Optional[str]:
@@ -103,8 +107,125 @@ def column_exists(df: pd.DataFrame, options: List[str]) -> Optional[str]:
     return None
 
 
+def get_coordinate_display_label(coordinate_kind: str, selected_projected_crs: Optional[str]) -> str:
+    if coordinate_kind == "none":
+        return "N/A"
+
+    if coordinate_kind == "decimal_degrees":
+        return "Ready"
+
+    if coordinate_kind == "projected_crs_required":
+        if selected_projected_crs:
+            return "Ready"
+        return "Needs CRS"
+
+    return "N/A"
+
+
+def get_coordinate_note(coordinate_kind: str, selected_projected_crs: Optional[str]) -> Optional[str]:
+    if coordinate_kind == "none":
+        return None
+
+    if coordinate_kind == "decimal_degrees":
+        return "Coordinates are ready for mapping."
+
+    if coordinate_kind == "projected_crs_required" and selected_projected_crs:
+        return "Coordinates are ready for mapping."
+
+    if coordinate_kind == "projected_crs_required":
+        return "Coordinates need a CRS before mapping."
+
+    return None
+
+
 # -----------------------------
-# Schema detection: rules first, optional AI refinement
+# Intent routing
+# -----------------------------
+
+SPECIES_WORDS = [
+    "live oak", "water oak", "willow oak", "overcup oak", "laurel oak",
+    "loblolly pine", "flowering dogwood", "crape myrtle", "southern magnolia",
+    "oak", "pine", "palm", "maple", "elm", "magnolia", "crapemyrtle",
+    "cypress", "cedar", "holly", "palmetto", "dogwood", "poplar", "birch",
+]
+
+DATA_ACTION_WORDS = [
+    "map", "plot", "where", "location", "locations", "geographic",
+    "show", "list", "find", "filter", "count", "how many", "number of",
+    "top", "most common", "common species", "diameter", "dbh", "height",
+    "native", "introduced", "non-native", "condition", "danger", "hazard",
+    "risk", "tree", "trees", "species", "dataset", "csv", "row", "rows",
+    "column", "columns", "records",
+]
+
+FOLLOWUP_WORDS = [
+    "those", "these", "them", "that", "same", "previous", "last result",
+    "last results", "that group", "those trees", "these trees",
+]
+
+
+def classify_prompt_type(prompt: str) -> str:
+    q = prompt.lower().strip()
+
+    if not q:
+        return "empty"
+
+    if any(term in q for term in DATA_ACTION_WORDS):
+        return "data"
+
+    if any(species in q for species in SPECIES_WORDS):
+        return "data"
+
+    return "general_chat"
+
+
+def question_is_map_request(question: str) -> bool:
+    q = question.lower()
+    return any(word in q for word in ["map", "plot", "where", "location", "locations", "geographic"])
+
+
+def is_followup_prompt(question: str) -> bool:
+    q = question.lower()
+    return any(word in q for word in FOLLOWUP_WORDS)
+
+
+def has_filter_values(instructions: Dict[str, Any]) -> bool:
+    return any([
+        instructions.get("species_text") is not None,
+        instructions.get("native_text") is not None,
+        instructions.get("min_diameter") is not None,
+        instructions.get("max_diameter") is not None,
+        instructions.get("danger_value") is not None,
+    ])
+
+
+def merge_followup_filters(
+    current_instructions: Dict[str, Any],
+    previous_filter_instructions: Optional[Dict[str, Any]],
+    question: str,
+) -> Dict[str, Any]:
+    if not previous_filter_instructions:
+        return current_instructions
+
+    if has_filter_values(current_instructions):
+        return current_instructions
+
+    if "all" in question.lower():
+        return current_instructions
+
+    if not is_followup_prompt(question):
+        return current_instructions
+
+    merged = dict(current_instructions)
+
+    for key in ["species_text", "native_text", "min_diameter", "max_diameter", "danger_value"]:
+        merged[key] = previous_filter_instructions.get(key)
+
+    return merged
+
+
+# -----------------------------
+# Schema detection
 # -----------------------------
 
 def score_column_name(col: str, positive_terms: List[str], negative_terms: Optional[List[str]] = None) -> int:
@@ -448,8 +569,8 @@ def get_map_coordinates(
     if coordinate_kind == "projected_crs_required":
         if not selected_projected_crs:
             return None, None, (
-                "Coordinate fields were found, but they are projected coordinates rather than normal decimal latitude/longitude. "
-                "Select a projected CRS in the sidebar before mapping."
+                "Coordinate fields were found, but they need a coordinate system before mapping. "
+                "Choose a projected CRS in Advanced options."
             )
 
         try:
@@ -460,7 +581,6 @@ def get_map_coordinates(
         try:
             transformer = Transformer.from_crs(selected_projected_crs, "EPSG:4326", always_xy=True)
 
-            # For the UGA-style dataset, LONG behaves like X/easting and LAT behaves like Y/northing.
             lon_values, lat_values = transformer.transform(
                 raw_lon.to_numpy(),
                 raw_lat.to_numpy(),
@@ -511,14 +631,7 @@ def parse_with_rules(question: str) -> Dict[str, Any]:
     elif any(word in q for word in ["show", "list", "find", "filter"]):
         instructions["intent"] = "filter"
 
-    species_words = [
-        "live oak", "water oak", "willow oak", "overcup oak", "laurel oak",
-        "loblolly pine", "flowering dogwood", "crape myrtle", "southern magnolia",
-        "oak", "pine", "palm", "maple", "elm", "magnolia", "crapemyrtle",
-        "cypress", "cedar", "holly", "palmetto", "dogwood", "poplar", "birch",
-    ]
-
-    for word in sorted(species_words, key=len, reverse=True):
+    for word in sorted(SPECIES_WORDS, key=len, reverse=True):
         if word in q:
             instructions["species_text"] = word
             if instructions["intent"] == "summary":
@@ -578,7 +691,7 @@ Use intent native_summary for native/introduced questions.
 Use intent diameter_summary for diameter/DBH/bin questions.
 Use intent danger_summary and danger_value 1 for danger/hazard questions.
 Use intent map and make_map true for map/location questions.
-For species groups like oak, pine, dogwood, maple, magnolia, put the word in species_text.
+For species groups like oak, pine, dogwood, poplar, maple, magnolia, etc., put the word in species_text.
 For native trees, set native_text to naturally_occurring.
 
 Question: {question}
@@ -638,8 +751,39 @@ def interpret_question(question: str, schema: Dict[str, Any], model_name: str, u
 
 
 # -----------------------------
-# Query execution and summaries
+# Query execution, caching, summaries
 # -----------------------------
+
+def make_query_cache_key(
+    csv_name: str,
+    df: pd.DataFrame,
+    schema: Dict[str, Any],
+    instructions: Dict[str, Any],
+) -> str:
+    roles = schema.get("roles", {})
+
+    cache_payload = {
+        "csv_name": csv_name,
+        "row_count": len(df),
+        "schema_method": schema.get("schema_method", "unknown"),
+        "roles": {
+            "species_common": roles.get("species_common"),
+            "scientific_name": roles.get("scientific_name"),
+            "native_status": roles.get("native_status"),
+            "diameter_numeric": roles.get("diameter_numeric"),
+            "danger_flag": roles.get("danger_flag"),
+        },
+        "filters": {
+            "species_text": instructions.get("species_text"),
+            "native_text": instructions.get("native_text"),
+            "min_diameter": instructions.get("min_diameter"),
+            "max_diameter": instructions.get("max_diameter"),
+            "danger_value": instructions.get("danger_value"),
+        },
+    }
+
+    return json.dumps(cache_payload, sort_keys=True)
+
 
 def apply_filters(df: pd.DataFrame, schema: Dict[str, Any], instructions: Dict[str, Any]) -> Tuple[pd.DataFrame, List[str], List[str]]:
     roles = schema["roles"]
@@ -703,6 +847,44 @@ def apply_filters(df: pd.DataFrame, schema: Dict[str, Any], instructions: Dict[s
     return filtered, filters, warnings
 
 
+def get_or_run_filtered_query(
+    csv_name: str,
+    df: pd.DataFrame,
+    schema: Dict[str, Any],
+    instructions: Dict[str, Any],
+) -> Tuple[pd.DataFrame, List[str], List[str], bool, str]:
+    if "query_cache" not in st.session_state:
+        st.session_state["query_cache"] = {}
+
+    cache = st.session_state["query_cache"]
+    cache_key = make_query_cache_key(csv_name, df, schema, instructions)
+
+    if cache_key in cache:
+        cached = cache[cache_key]
+        try:
+            filtered_df = df.loc[cached["indices"]].copy()
+        except Exception:
+            filtered_df, filters, warnings = apply_filters(df, schema, instructions)
+            cache[cache_key] = {
+                "indices": filtered_df.index.tolist(),
+                "filters": filters,
+                "warnings": warnings,
+            }
+            return filtered_df, filters, warnings, False, cache_key
+
+        return filtered_df, cached["filters"], cached["warnings"], True, cache_key
+
+    filtered_df, filters, warnings = apply_filters(df, schema, instructions)
+
+    cache[cache_key] = {
+        "indices": filtered_df.index.tolist(),
+        "filters": filters,
+        "warnings": warnings,
+    }
+
+    return filtered_df, filters, warnings, False, cache_key
+
+
 def make_diameter_table(df: pd.DataFrame, schema: Dict[str, Any]) -> Tuple[Optional[pd.DataFrame], str]:
     roles = schema["roles"]
     bin_col = roles.get("diameter_bin")
@@ -752,6 +934,7 @@ def build_result(
     filters: List[str],
     warnings: List[str],
     coord_rows: int,
+    cache_hit: bool,
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any]]:
     roles = schema["roles"]
     total_rows = len(df)
@@ -838,13 +1021,50 @@ def build_result(
         "map_requested": bool(instructions.get("make_map")),
         "coordinate_rows_in_dataset": int(coord_rows),
         "coordinate_kind": schema.get("coordinate_kind"),
+        "cache_hit": cache_hit,
     }
 
     return table_df, preview_df, payload
 
 
-def explain_result(payload: Dict[str, Any], model_name: str, use_model_explanation: bool) -> str:
+# -----------------------------
+# AI responses
+# -----------------------------
+
+def explain_general_chat(prompt: str, model_name: str, use_model_explanation: bool) -> str:
+    fallback = "I’m ready to help with the tree dataset. You can ask me to count, summarize, filter, or map trees."
+
     if not use_model_explanation:
+        return fallback
+
+    system_prompt = f"""
+You are a helpful assistant inside a local tree-data demo app.
+The user may casually chat with you, but you should not pretend to analyze the CSV unless they ask a data question.
+Answer in 1 to 2 sentences.
+If useful, mention that you can help count, summarize, filter, or map trees.
+User message: {prompt}
+"""
+    try:
+        response = ollama.chat(
+            model=model_name,
+            messages=[{"role": "user", "content": system_prompt}],
+            options={"temperature": 0.3, "num_predict": 120},
+        )
+        text = response["message"]["content"].strip()
+        return text if text else fallback
+    except Exception:
+        return fallback
+
+
+def explain_result(
+    payload: Dict[str, Any],
+    model_name: str,
+    use_model_explanation: bool,
+    selected_projected_crs: Optional[str],
+) -> str:
+    if not use_model_explanation:
+        if payload.get("map_requested"):
+            return "Here’s your map. " + payload["verified_summary"]
         return payload["verified_summary"]
 
     user_facing_payload = {
@@ -860,15 +1080,35 @@ def explain_result(payload: Dict[str, Any], model_name: str, use_model_explanati
     }
 
     if payload.get("map_requested"):
-        user_facing_payload["map_note"] = (
-            f"A map was requested. Coordinate rows available: {payload['coordinate_rows_in_dataset']}. "
-            f"Coordinate type: {payload.get('coordinate_kind')}."
-        )
+        if selected_projected_crs:
+            user_facing_payload["map_note"] = (
+                f"A map was requested. Coordinate rows available: {payload['coordinate_rows_in_dataset']}. "
+                f"The app transformed the coordinate values using {selected_projected_crs} so they can be displayed on the map."
+            )
+        else:
+            user_facing_payload["map_note"] = (
+                f"A map was requested. Coordinate rows available: {payload['coordinate_rows_in_dataset']}. "
+                "A coordinate system must be selected before these coordinates can be mapped."
+            )
+
+    if payload.get("map_requested"):
+        instruction = """
+Write a friendly, direct answer that starts with "Here’s your map."
+Then mention the key count and percent if available.
+Do not repeat the user's question.
+"""
+    else:
+        instruction = """
+Write a friendly, direct answer.
+Mention the key count and percent if available.
+Do not repeat the user's question.
+"""
 
     prompt = f"""
 Use only the verified facts below. Write 2 to 4 plain-English sentences for a nontechnical supervisor.
 Do not invent facts. Do not recalculate numbers. Do not mention JSON or internal fields.
-Do not mention coordinate details unless map_note is present.
+If a map note is present, explain it in simple terms.
+{instruction}
 
 Verified facts:
 {json.dumps(user_facing_payload, indent=2)}
@@ -877,38 +1117,51 @@ Verified facts:
         response = ollama.chat(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0, "num_predict": 220},
+            options={"temperature": 0.2, "num_predict": 220},
         )
         text = response["message"]["content"].strip()
         lowered = text.lower()
 
         forbidden = [
-    "over 99%",
-    "almost all",
-    "forest surveyed",
-    "map_requested",
-    "json",
-    "coordinate information is not available",
-    "coordinates are not available",
-    "coordinate data is not available",
+            "over 99%",
+            "almost all",
+            "forest surveyed",
+            "map_requested",
+            "json",
+            "coordinate information is not available",
+            "coordinates are not available",
+            "coordinate data is not available",
         ]
 
         if not payload.get("map_requested"):
             forbidden.extend(["coordinate data", "coordinate rows", "missing coordinate"])
 
         if any(term in lowered for term in forbidden):
+            if payload.get("map_requested"):
+                return "Here’s your map. " + payload["verified_summary"]
             return payload["verified_summary"]
 
         if payload.get("result_available"):
             count_text = str(payload["matching_record_count"])
             if count_text not in text.replace(",", ""):
+                if payload.get("map_requested"):
+                    return "Here’s your map. " + payload["verified_summary"]
                 return payload["verified_summary"]
+
+        if payload.get("map_requested") and "map" not in lowered:
+            return "Here’s your map. " + text
 
         return text
 
     except Exception:
+        if payload.get("map_requested"):
+            return "Here’s your map. " + payload["verified_summary"]
         return payload["verified_summary"]
 
+
+# -----------------------------
+# Map creation
+# -----------------------------
 
 def make_map(
     df: pd.DataFrame,
@@ -972,20 +1225,120 @@ def make_map(
     return m, None
 
 
-def get_coordinate_display_label(coordinate_kind: str, selected_projected_crs: Optional[str]) -> str:
-    if coordinate_kind == "none":
-        return "N/A"
+# -----------------------------
+# Chat helpers
+# -----------------------------
 
-    if coordinate_kind == "decimal_degrees":
-        return "Lat/Lon"
+def init_chat_state(csv_name: str) -> Tuple[str, Dict[str, Any], str]:
+    chats_key = f"chats::{csv_name}"
+    active_key = f"active_chat::{csv_name}"
 
-    if coordinate_kind == "projected_crs_required":
-        if selected_projected_crs:
-            return f"Projected → {selected_projected_crs}"
-        return "Projected / CRS needed"
+    if chats_key not in st.session_state:
+        first_id = str(uuid4())
+        st.session_state[chats_key] = {
+            first_id: {
+                "title": "New chat",
+                "messages": [],
+            }
+        }
+        st.session_state[active_key] = first_id
 
-    return "N/A"
+    if active_key not in st.session_state or st.session_state[active_key] not in st.session_state[chats_key]:
+        st.session_state[active_key] = next(iter(st.session_state[chats_key]))
 
+    return chats_key, st.session_state[chats_key], st.session_state[active_key]
+
+
+def create_new_chat(csv_name: str) -> None:
+    chats_key = f"chats::{csv_name}"
+    active_key = f"active_chat::{csv_name}"
+
+    new_id = str(uuid4())
+    count = len(st.session_state.get(chats_key, {})) + 1
+
+    st.session_state[chats_key][new_id] = {
+        "title": f"Chat {count}",
+        "messages": [],
+    }
+    st.session_state[active_key] = new_id
+
+
+def render_assistant_results(
+    results: List[Dict[str, Any]],
+    csv_name: str,
+    active_chat_id: str,
+    message_index: int,
+    selected_projected_crs: Optional[str],
+) -> None:
+    for result_index, result in enumerate(results):
+        if result.get("type") == "general_chat":
+            st.write(result["content"])
+            continue
+
+        instructions = result["instructions"]
+        filtered_df = result["filtered_df"]
+        table_df = result["table_df"]
+        preview_df = result["preview_df"]
+        payload = result["payload"]
+        explanation = result["explanation"]
+        result_roles = result["roles"]
+        coordinate_kind = result.get("coordinate_kind", "none")
+
+        st.write(explanation)
+
+        if instructions.get("make_map") or instructions.get("intent") == "map":
+            popup_cols = [
+                result_roles.get("species_common"),
+                result_roles.get("scientific_name"),
+                result_roles.get("diameter_numeric"),
+                result_roles.get("height_numeric"),
+            ]
+
+            map_schema = {
+                "roles": result_roles,
+                "coordinate_kind": coordinate_kind,
+            }
+
+            m, error = make_map(
+                filtered_df,
+                map_schema,
+                popup_cols,
+                selected_projected_crs,
+            )
+
+            if error:
+                st.warning(error)
+            elif m is not None:
+                st_folium(
+                    m,
+                    width=1000,
+                    height=600,
+                    key=f"map::{csv_name}::{active_chat_id}::{message_index}::{result_index}",
+                    returned_objects=[],
+                )
+
+        with st.expander("Data result", expanded=False):
+            if payload.get("result_available"):
+                st.write(f"Matching records: {len(filtered_df):,}")
+            else:
+                st.write("Matching records: not applicable")
+
+            if payload.get("cache_hit"):
+                st.caption("Reused cached query result.")
+
+            if table_df is not None:
+                st.dataframe(table_df, use_container_width=True)
+
+            if preview_df is not None:
+                with st.expander("Preview matching rows", expanded=False):
+                    st.dataframe(preview_df, use_container_width=True)
+
+        with st.expander("Developer details", expanded=False):
+            st.write("Question interpretation")
+            st.json(instructions)
+            st.write("Detected dataset roles")
+            st.json(result_roles)
+            st.write(f"Cache hit: {payload.get('cache_hit', False)}")
 
 
 # -----------------------------
@@ -993,8 +1346,9 @@ def get_coordinate_display_label(coordinate_kind: str, selected_projected_crs: O
 # -----------------------------
 
 st.set_page_config(page_title="Tree AI Demo", layout="wide")
+
 st.title("Tree AI Demo")
-st.write("This demo uses a local AI model to interpret questions, query a tree CSV, and explain the results.")
+st.write("Ask questions about a tree CSV. The app queries the data, explains the answer, and can map results when coordinates are usable.")
 
 csv_files = get_tree_csv_files()
 
@@ -1002,7 +1356,7 @@ if not csv_files:
     st.error("No tree CSV files found. Put your tree CSV file inside the data folder.")
     st.stop()
 
-csv_choice = st.sidebar.selectbox("Choose tree CSV", csv_files, format_func=lambda x: x.name)
+csv_choice = st.sidebar.selectbox("Dataset", csv_files, format_func=lambda x: x.name)
 df = load_csv(csv_choice)
 
 models = get_installed_ollama_models()
@@ -1026,69 +1380,10 @@ if "use_model_parse" not in st.session_state:
 if "use_model_explanation" not in st.session_state:
     st.session_state["use_model_explanation"] = True
 
-st.sidebar.header("AI model")
-
-with st.sidebar.form("model_settings_form"):
-    question_model_choice = st.selectbox(
-        "Question/explanation model",
-        models,
-        index=models.index(st.session_state["question_model"]) if st.session_state["question_model"] in models else 0,
-    )
-
-    schema_model_choice = st.selectbox(
-        "Schema refinement model",
-        models,
-        index=models.index(st.session_state["schema_model"]) if st.session_state["schema_model"] in models else 0,
-    )
-
-    parse_choice = st.checkbox(
-        "Use model for question interpretation",
-        value=st.session_state["use_model_parse"],
-    )
-
-    explanation_choice = st.checkbox(
-        "Use model for explanation",
-        value=st.session_state["use_model_explanation"],
-    )
-
-    settings_submitted = st.form_submit_button("Apply model settings")
-
-if settings_submitted:
-    st.session_state["question_model"] = question_model_choice
-    st.session_state["schema_model"] = schema_model_choice
-    st.session_state["use_model_parse"] = parse_choice
-    st.session_state["use_model_explanation"] = explanation_choice
-    st.rerun()
-
 model_name = st.session_state["question_model"]
 schema_model_name = st.session_state["schema_model"]
 use_model_parse = st.session_state["use_model_parse"]
 use_model_explanation = st.session_state["use_model_explanation"]
-
-st.sidebar.caption(f"Question model: `{model_name}`")
-st.sidebar.caption(f"Schema model: `{schema_model_name}`")
-
-st.sidebar.header("Mapping")
-
-crs_choice = st.sidebar.selectbox(
-    "Projected coordinate system",
-    [
-        "Unknown / do not map",
-        "EPSG:32617 - WGS 84 / UTM Zone 17N",
-        "EPSG:26917 - NAD83 / UTM Zone 17N",
-    ],
-    index=1,
-    help=(
-        "Only needed when coordinate values are projected coordinates instead of decimal latitude/longitude. "
-        "For UGA campus data, try EPSG:32617 first, then EPSG:26917 if needed."
-    ),
-)
-
-selected_projected_crs = None
-if crs_choice.startswith("EPSG:32617"):
-    selected_projected_crs = "EPSG:32617"
-elif crs_choice.startswith("EPSG:26917"):
-    selected_projected_crs = "EPSG:26917"
 
 base_schema = infer_schema_rules_only(csv_choice.name, df)
 schema_key = f"schema::{csv_choice.name}"
@@ -1096,7 +1391,53 @@ schema_key = f"schema::{csv_choice.name}"
 if schema_key not in st.session_state:
     st.session_state[schema_key] = base_schema
 
-st.sidebar.header("Schema")
+schema = st.session_state[schema_key]
+roles = schema["roles"]
+
+coord_rows = 0
+if roles.get("latitude") and roles.get("longitude"):
+    coord_rows = df[[roles["latitude"], roles["longitude"]]].dropna().shape[0]
+
+crs_options = [
+    "Unknown / do not map",
+    "EPSG:32617 - WGS 84 / UTM Zone 17N",
+    "EPSG:26917 - NAD83 / UTM Zone 17N",
+]
+
+crs_key = f"crs_choice::{csv_choice.name}"
+if crs_key not in st.session_state:
+    st.session_state[crs_key] = crs_options[1]
+
+selected_projected_crs = None
+if st.session_state[crs_key].startswith("EPSG:32617"):
+    selected_projected_crs = "EPSG:32617"
+elif st.session_state[crs_key].startswith("EPSG:26917"):
+    selected_projected_crs = "EPSG:26917"
+
+chats_key, chats, active_chat_id = init_chat_state(csv_choice.name)
+
+if st.sidebar.button("New chat", use_container_width=True):
+    create_new_chat(csv_choice.name)
+    st.rerun()
+
+chat_ids = list(st.session_state[chats_key].keys())
+active_index = chat_ids.index(st.session_state[f"active_chat::{csv_choice.name}"])
+
+selected_chat_id = st.sidebar.selectbox(
+    "Chat history",
+    chat_ids,
+    index=active_index,
+    format_func=lambda cid: st.session_state[chats_key][cid]["title"],
+)
+
+if selected_chat_id != st.session_state[f"active_chat::{csv_choice.name}"]:
+    st.session_state[f"active_chat::{csv_choice.name}"] = selected_chat_id
+    st.rerun()
+
+active_chat_id = st.session_state[f"active_chat::{csv_choice.name}"]
+messages = st.session_state[chats_key][active_chat_id]["messages"]
+
+last_filter_key = f"last_filter::{csv_choice.name}::{active_chat_id}"
 
 if "schema_refine_executor" not in st.session_state:
     st.session_state["schema_refine_executor"] = ThreadPoolExecutor(max_workers=1)
@@ -1104,7 +1445,8 @@ if "schema_refine_executor" not in st.session_state:
 refine_future_key = f"schema_refine_future::{csv_choice.name}"
 refine_model_key = f"schema_refine_model::{csv_choice.name}"
 refine_error_key = f"schema_refine_error::{csv_choice.name}"
-pending_question_key = f"pending_question::{csv_choice.name}"
+pending_schema_question_key = f"pending_schema_question::{csv_choice.name}"
+pending_chat_key = f"pending_chat::{csv_choice.name}::{active_chat_id}"
 
 refine_running = (
     refine_future_key in st.session_state
@@ -1137,108 +1479,141 @@ refine_running = (
     and not st.session_state[refine_future_key].done()
 )
 
-current_schema_for_status = st.session_state.get(schema_key, base_schema)
-schema_method = current_schema_for_status.get("schema_method", "rules_only")
-
-if refine_running:
-    running_model = st.session_state.get(refine_model_key, "selected model")
-    st.sidebar.markdown(f"🟠 **Schema refinement running**  \nModel: `{running_model}`")
-
-    if st_autorefresh is not None:
-        st_autorefresh(interval=2000, key=f"schema_refine_poll::{csv_choice.name}")
-    else:
-        st.sidebar.warning("Auto-refresh is not installed. Run: pip install streamlit-autorefresh")
-
-elif refine_error_key in st.session_state:
-    st.sidebar.markdown("🔴 **Schema refinement failed**")
-    st.sidebar.caption(st.session_state[refine_error_key])
-
-elif str(schema_method).startswith("ai_refined"):
-    st.sidebar.markdown(f"🟢 **Schema refined with AI**  \nMethod: `{schema_method}`")
-
-else:
-    st.sidebar.markdown("🔴 **Schema not AI-refined yet**  \nUsing rules-only detection.")
-
-if st.sidebar.button("Refine schema with AI", disabled=refine_running):
-    st.session_state[refine_model_key] = schema_model_name
-
-    st.session_state[refine_future_key] = st.session_state["schema_refine_executor"].submit(
-        refine_schema_job,
-        df.copy(),
-        csv_choice.name,
-        base_schema,
-        schema_model_name,
-    )
-
-    if refine_error_key in st.session_state:
-        del st.session_state[refine_error_key]
-
-    st.rerun()
-
-if st.sidebar.button("Reset schema to rules", disabled=refine_running):
-    st.session_state[schema_key] = base_schema
-
-    if refine_error_key in st.session_state:
-        del st.session_state[refine_error_key]
-
-    st.rerun()
-
 schema = st.session_state[schema_key]
 roles = schema["roles"]
+schema_method = schema.get("schema_method", "rules_only")
 
-coord_rows = 0
-if roles.get("latitude") and roles.get("longitude"):
-    coord_rows = df[[roles["latitude"], roles["longitude"]]].dropna().shape[0]
+if refine_running and st_autorefresh is not None:
+    st_autorefresh(interval=2000, key=f"schema_refine_poll::{csv_choice.name}")
+
+with st.sidebar.expander("Advanced options", expanded=False):
+    st.markdown("### AI model")
+
+    with st.form("model_settings_form"):
+        question_model_choice = st.selectbox(
+            "Question/explanation model",
+            models,
+            index=models.index(st.session_state["question_model"]) if st.session_state["question_model"] in models else 0,
+        )
+
+        schema_model_choice = st.selectbox(
+            "Schema refinement model",
+            models,
+            index=models.index(st.session_state["schema_model"]) if st.session_state["schema_model"] in models else 0,
+        )
+
+        parse_choice = st.checkbox(
+            "Use model for question interpretation",
+            value=st.session_state["use_model_parse"],
+        )
+
+        explanation_choice = st.checkbox(
+            "Use model for explanation",
+            value=st.session_state["use_model_explanation"],
+        )
+
+        settings_submitted = st.form_submit_button("Apply model settings")
+
+    if settings_submitted:
+        st.session_state["question_model"] = question_model_choice
+        st.session_state["schema_model"] = schema_model_choice
+        st.session_state["use_model_parse"] = parse_choice
+        st.session_state["use_model_explanation"] = explanation_choice
+        st.rerun()
+
+    st.caption(f"Question model: `{st.session_state['question_model']}`")
+    st.caption(f"Schema model: `{st.session_state['schema_model']}`")
+
+    st.markdown("### Mapping")
+
+    st.selectbox(
+        "Coordinate system",
+        crs_options,
+        key=crs_key,
+        help=(
+            "Only needed when coordinate values are not already normal latitude/longitude. "
+            "For UGA campus data, EPSG:32617 is the default."
+        ),
+    )
+
+    st.markdown("### Dataset setup")
+
+    if refine_running:
+        running_model = st.session_state.get(refine_model_key, "selected model")
+        st.markdown(f"🟠 **Schema refinement running**  \nModel: `{running_model}`")
+
+        if st_autorefresh is None:
+            st.warning("Auto-refresh is not installed. Run: python -m pip install streamlit-autorefresh")
+
+    elif refine_error_key in st.session_state:
+        st.markdown("🔴 **Schema refinement failed**")
+        st.caption(st.session_state[refine_error_key])
+
+    elif str(schema_method).startswith("ai_refined"):
+        st.markdown("🟢 **Dataset setup refined with AI**")
+
+    else:
+        st.markdown("🔴 **Using automatic setup**")
+
+    if st.button("Refine dataset setup with AI", disabled=refine_running, use_container_width=True):
+        st.session_state[refine_model_key] = st.session_state["schema_model"]
+
+        st.session_state[refine_future_key] = st.session_state["schema_refine_executor"].submit(
+            refine_schema_job,
+            df.copy(),
+            csv_choice.name,
+            base_schema,
+            st.session_state["schema_model"],
+        )
+
+        if refine_error_key in st.session_state:
+            del st.session_state[refine_error_key]
+
+        st.rerun()
+
+    if st.button("Reset dataset setup", disabled=refine_running, use_container_width=True):
+        st.session_state[schema_key] = base_schema
+
+        if refine_error_key in st.session_state:
+            del st.session_state[refine_error_key]
+
+        st.rerun()
+
+    with st.expander("Detected dataset roles"):
+        st.write(f"Schema method: {schema.get('schema_method', 'unknown')}")
+        st.json(roles)
+
+        if schema.get("ai_schema_guess"):
+            st.write("AI schema guess before validation")
+            st.json(schema.get("ai_schema_guess"))
+
+        if schema.get("rule_schema_guess"):
+            st.write("Rule-based schema guess")
+            st.json(schema.get("rule_schema_guess"))
+
+    if st.button("Clear query cache", use_container_width=True):
+        st.session_state["query_cache"] = {}
+        st.success("Query cache cleared.")
 
 st.subheader("Dataset overview")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Rows", f"{len(df):,}")
-c2.metric("Columns", len(df.columns))
-c3.metric("Rows with coordinates", f"{coord_rows:,}")
 coordinate_label = get_coordinate_display_label(
     schema.get("coordinate_kind", "none"),
     selected_projected_crs,
 )
 
-c4.metric("Coordinate type", coordinate_label)
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Rows", f"{len(df):,}")
+c2.metric("Columns", len(df.columns))
+c3.metric("Rows with coordinates", f"{coord_rows:,}")
+c4.metric("Coordinate status", coordinate_label)
 
-if schema.get("coordinate_kind") == "projected_crs_required":
-    if selected_projected_crs:
-        st.info(f"Projected coordinates detected. Mapping will transform coordinates using {selected_projected_crs}.")
-    else:
-        st.warning("Projected coordinates detected. Select a projected CRS in the sidebar before mapping.")
+coordinate_note = get_coordinate_note(schema.get("coordinate_kind", "none"), selected_projected_crs)
+if coordinate_note:
+    st.info(coordinate_note)
 
 with st.expander("Preview data"):
-    st.dataframe(df.head(25))
-
-with st.expander("Detected dataset roles"):
-    st.write(f"Schema method: {schema.get('schema_method', 'unknown')}")
-    st.json(roles)
-
-    if schema.get("ai_schema_guess"):
-        st.write("AI schema guess before validation")
-        st.json(schema.get("ai_schema_guess"))
-
-    if schema.get("rule_schema_guess"):
-        st.write("Rule-based schema guess")
-        st.json(schema.get("rule_schema_guess"))
-
-st.subheader("Ask a question")
-
-results_key = f"results::{csv_choice.name}"
-
-question_text = st.text_area(
-    "Ask one or more questions. Separate multiple questions with punctuation.",
-    value=st.session_state.get(
-        f"question_text::{csv_choice.name}",
-        "How many oak trees are there? Show native trees. What are the diameter bins?",
-    ),
-    height=100,
-    key=f"question_text::{csv_choice.name}",
-)
-
-run_pressed = st.button("Run")
+    st.dataframe(df.head(25), use_container_width=True)
 
 
 def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
@@ -1250,8 +1625,34 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
     computed_results = []
 
     for question in questions:
+        route = classify_prompt_type(question)
+
+        if route == "general_chat":
+            computed_results.append({
+                "type": "general_chat",
+                "content": explain_general_chat(question, model_name, use_model_explanation),
+            })
+            continue
+
         instructions = interpret_question(question, schema, model_name, use_model_parse)
-        filtered_df, filters, warnings = apply_filters(df, schema, instructions)
+
+        if question_is_map_request(question):
+            instructions["intent"] = "map"
+            instructions["make_map"] = True
+
+        previous_filter_instructions = st.session_state.get(last_filter_key)
+        instructions = merge_followup_filters(
+            instructions,
+            previous_filter_instructions,
+            question,
+        )
+
+        filtered_df, filters, warnings, cache_hit, query_cache_key = get_or_run_filtered_query(
+            csv_choice.name,
+            df,
+            schema,
+            instructions,
+        )
 
         table_df, preview_df, payload = build_result(
             df=df,
@@ -1262,11 +1663,28 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
             filters=filters,
             warnings=warnings,
             coord_rows=coord_rows,
+            cache_hit=cache_hit,
         )
 
-        explanation = explain_result(payload, model_name, use_model_explanation)
+        explanation = explain_result(
+            payload,
+            model_name,
+            use_model_explanation,
+            selected_projected_crs,
+        )
+
+        if has_filter_values(instructions):
+            st.session_state[last_filter_key] = {
+                "species_text": instructions.get("species_text"),
+                "native_text": instructions.get("native_text"),
+                "min_diameter": instructions.get("min_diameter"),
+                "max_diameter": instructions.get("max_diameter"),
+                "danger_value": instructions.get("danger_value"),
+                "query_cache_key": query_cache_key,
+            }
 
         computed_results.append({
+            "type": "data",
             "question": question,
             "instructions": instructions,
             "filtered_df": filtered_df,
@@ -1275,99 +1693,80 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
             "payload": payload,
             "explanation": explanation,
             "roles": dict(roles),
+            "coordinate_kind": schema.get("coordinate_kind", "none"),
+            "query_cache_key": query_cache_key,
         })
 
     return computed_results
 
 
-if run_pressed and refine_running:
-    st.session_state[pending_question_key] = question_text
-    st.warning(
-        "Schema refinement is currently running. Your question has been queued and will run automatically when refinement finishes."
-    )
-
-elif run_pressed and not refine_running:
-    with st.spinner("Interpreting question and querying data..."):
-        st.session_state[results_key] = compute_results_for_query(question_text)
-
-elif not refine_running and pending_question_key in st.session_state:
-    queued_question = st.session_state[pending_question_key]
-    del st.session_state[pending_question_key]
-
-    with st.spinner("Schema refinement finished. Running your queued question now..."):
-        st.session_state[results_key] = compute_results_for_query(queued_question)
-
-    st.info("Schema refinement finished. Your queued question has been run.")
-
-
-saved_results = st.session_state.get(results_key, [])
-
-if saved_results:
-    for i, result in enumerate(saved_results):
-        question = result["question"]
-        instructions = result["instructions"]
-        filtered_df = result["filtered_df"]
-        table_df = result["table_df"]
-        preview_df = result["preview_df"]
-        payload = result["payload"]
-        explanation = result["explanation"]
-        result_roles = result["roles"]
-
-        st.divider()
-        st.subheader(f"Question: {question}")
-
-        with st.expander("AI interpretation"):
-            st.write("Question interpretation")
-            st.json(instructions)
-            st.write("Detected dataset roles")
-            st.json(result_roles)
-
-        st.markdown("### Plain-English answer")
-        st.write(explanation)
-
-        st.markdown("### Data result")
-
-        if payload.get("result_available"):
-            st.write(f"Matching records: {len(filtered_df):,}")
+for message_index, message in enumerate(messages):
+    with st.chat_message(message["role"]):
+        if message["role"] == "user":
+            st.write(message["content"])
         else:
-            st.write("Matching records: not applicable")
+            if message.get("content"):
+                st.write(message["content"])
 
-        if table_df is not None:
-            st.dataframe(table_df)
-
-        if preview_df is not None:
-            with st.expander("Preview matching rows"):
-                st.dataframe(preview_df)
-
-        if instructions.get("make_map") or instructions.get("intent") == "map":
-            st.markdown("### Map")
-
-            popup_cols = [
-                result_roles.get("species_common"),
-                result_roles.get("scientific_name"),
-                result_roles.get("diameter_numeric"),
-                result_roles.get("height_numeric"),
-            ]
-
-            map_schema = {
-                "roles": result_roles,
-                "coordinate_kind": schema.get("coordinate_kind", "none"),
-            }
-
-            m, error = make_map(
-                filtered_df,
-                map_schema,
-                popup_cols,
-                selected_projected_crs,
-            )
-
-            if error:
-                st.warning(error)
-            elif m is not None:
-                st_folium(
-                    m,
-                    width=1000,
-                    height=600,
-                    key=f"map::{csv_choice.name}::{i}",
-                    returned_objects=[],
+            if message.get("results"):
+                render_assistant_results(
+                    message["results"],
+                    csv_choice.name,
+                    active_chat_id,
+                    message_index,
+                    selected_projected_crs,
                 )
+
+if not refine_running and pending_schema_question_key in st.session_state:
+    queued_question = st.session_state[pending_schema_question_key]
+    del st.session_state[pending_schema_question_key]
+
+    with st.spinner("Dataset setup finished. Answering your queued question..."):
+        messages.append({
+            "role": "assistant",
+            "results": compute_results_for_query(queued_question),
+        })
+
+    st.rerun()
+
+if pending_chat_key in st.session_state and not refine_running:
+    pending_prompt = st.session_state[pending_chat_key]
+    del st.session_state[pending_chat_key]
+
+    with st.spinner("Thinking..."):
+        results = compute_results_for_query(pending_prompt)
+
+    messages.append({
+        "role": "assistant",
+        "results": results,
+    })
+
+    st.rerun()
+
+prompt = st.chat_input("Ask about the tree dataset...")
+
+if prompt:
+    cleaned_prompt = normalize_prompt(prompt)
+
+    messages.append({
+        "role": "user",
+        "content": cleaned_prompt,
+    })
+
+    current_title = st.session_state[chats_key][active_chat_id]["title"]
+    if current_title.startswith("New chat") or current_title.startswith("Chat "):
+        title = cleaned_prompt
+        if len(title) > 40:
+            title = title[:37] + "..."
+        st.session_state[chats_key][active_chat_id]["title"] = title
+
+    if refine_running:
+        st.session_state[pending_schema_question_key] = cleaned_prompt
+        messages.append({
+            "role": "assistant",
+            "content": "Dataset setup is still running. I queued your question and will answer it when setup finishes.",
+        })
+        st.rerun()
+
+    st.session_state[pending_chat_key] = cleaned_prompt
+    st.rerun()
