@@ -9,6 +9,7 @@ import folium
 import ollama
 import pandas as pd
 import streamlit as st
+from folium.plugins import Draw
 from streamlit_folium import st_folium
 
 try:
@@ -16,7 +17,38 @@ try:
 except Exception:
     st_autorefresh = None
 
+
 DATA_DIR = Path("data")
+APP_STATE_VERSION = "stable_chat_tree_ai_2026_06_04_v1"
+APP_NAME = "Canopy"
+APP_DESCRIPTION = (
+    "an AI knowledge base for forestry, tree inventory, and spatial datasets. "
+    "It can summarize existing datasets, answer natural-language questions, filter records, "
+    "and map usable location data."
+)
+
+MAP_TILE_OPTIONS = {
+    "Standard": {
+        "tiles": "OpenStreetMap",
+        "attr": None,
+    },
+    "Light": {
+        "tiles": "CartoDB positron",
+        "attr": None,
+    },
+    "Dark": {
+        "tiles": "CartoDB dark_matter",
+        "attr": None,
+    },
+    "Terrain": {
+        "tiles": "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+        "attr": "Map data: OpenStreetMap contributors, SRTM | Map style: OpenTopoMap",
+    },
+    "Satellite": {
+        "tiles": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "attr": "Tiles: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+    },
+}
 
 
 # -----------------------------
@@ -54,6 +86,35 @@ def load_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+def get_ollama_content(response: Any) -> str:
+    try:
+        if isinstance(response, dict):
+            message = response.get("message", {})
+            if isinstance(message, dict):
+                return str(message.get("content", "") or "")
+            return str(getattr(message, "content", "") or "")
+
+        message = getattr(response, "message", None)
+        if isinstance(message, dict):
+            return str(message.get("content", "") or "")
+
+        return str(getattr(message, "content", "") or "")
+    except Exception:
+        return ""
+
+
+def safe_ollama_chat(model_name: str, prompt: str, options: Optional[Dict[str, Any]] = None) -> str:
+    try:
+        response = ollama.chat(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            options=options or {},
+        )
+        return get_ollama_content(response).strip()
+    except Exception:
+        return ""
+
+
 # -----------------------------
 # Generic helpers
 # -----------------------------
@@ -65,7 +126,7 @@ def safe_string(value: Any) -> str:
 
 
 def normalize_prompt(text: str) -> str:
-    return text.strip().rstrip("\\").strip()
+    return str(text).strip().rstrip("\\").strip()
 
 
 def extract_json(text: str) -> Optional[Dict[str, Any]]:
@@ -90,11 +151,23 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
 
 def split_questions(text: str) -> List[str]:
     text = normalize_prompt(text)
+
     if not text:
         return []
 
-    parts = re.split(r"(?<=[?.!])\s+", text)
-    return [normalize_prompt(part) for part in parts if normalize_prompt(part)]
+    parts = re.split(
+        r"(?<=[?.!;])\s+|\s+(?:and\s+also|also)\s+|\s+and\s+(?=(?:what|what's|whats|who|which|where|when|why|how|can|could|would|show|list|map|count)\b)",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    cleaned = []
+    for part in parts:
+        part = normalize_prompt(part)
+        if part:
+            cleaned.append(part)
+
+    return cleaned
 
 
 def column_exists(df: pd.DataFrame, options: List[str]) -> Optional[str]:
@@ -182,6 +255,31 @@ def classify_prompt_type(prompt: str) -> str:
 def question_is_map_request(question: str) -> bool:
     q = question.lower()
     return any(word in q for word in ["map", "plot", "where", "location", "locations", "geographic"])
+
+
+def question_is_species_list_request(question: str) -> bool:
+    q = question.lower()
+
+    if "species" not in q:
+        return False
+
+    species_list_phrases = [
+        "what are",
+        "list",
+        "show",
+        "all",
+        "which species",
+        "tree species",
+        "species in the dataset",
+        "how many different",
+        "how many unique",
+        "different tree species",
+        "unique tree species",
+        "different species",
+        "unique species",
+    ]
+
+    return any(phrase in q for phrase in species_list_phrases)
 
 
 def is_followup_prompt(question: str) -> bool:
@@ -479,16 +577,13 @@ Rules:
 - LAT/LONG/X/Y/northing/easting-like numeric columns can be coordinate fields.
 - IsDANGER/danger/hazard/risk-like fields can be danger flags.
 """
-    try:
-        response = ollama.chat(
-            model=model_name,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0, "num_predict": 350},
-        )
-        parsed = extract_json(response["message"]["content"].strip())
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
+    text = safe_ollama_chat(
+        model_name,
+        prompt,
+        options={"temperature": 0, "num_predict": 350},
+    )
+    parsed = extract_json(text)
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def merge_ai_schema(df: pd.DataFrame, base_schema: Dict[str, Any], ai_guess: Dict[str, Any], model_name: str) -> Dict[str, Any]:
@@ -594,6 +689,66 @@ def get_map_coordinates(
     return None, None, "No usable coordinates were found."
 
 
+def get_map_status(
+    df: pd.DataFrame,
+    schema: Dict[str, Any],
+    selected_projected_crs: Optional[str],
+) -> Dict[str, Any]:
+    roles = schema.get("roles", {})
+    lat_col = roles.get("latitude")
+    lon_col = roles.get("longitude")
+    coordinate_kind = schema.get("coordinate_kind", "none")
+
+    status = {
+        "map_available": False,
+        "coordinate_rows": 0,
+        "message": None,
+        "coordinate_kind": coordinate_kind,
+    }
+
+    if not lat_col or not lon_col or coordinate_kind == "none":
+        status["message"] = "No usable coordinate columns were detected in this CSV."
+        return status
+
+    map_df = df.dropna(subset=[lat_col, lon_col]).copy()
+
+    if len(map_df) == 0:
+        status["message"] = "No rows have usable coordinate values."
+        return status
+
+    lat_values, lon_values, error = get_map_coordinates(
+        map_df,
+        lat_col,
+        lon_col,
+        coordinate_kind,
+        selected_projected_crs,
+    )
+
+    if error:
+        status["message"] = error
+        return status
+
+    if lat_values is None or lon_values is None:
+        status["message"] = "Could not prepare coordinates for mapping."
+        return status
+
+    valid = (
+        lat_values.notna()
+        & lon_values.notna()
+        & lat_values.between(-90, 90)
+        & lon_values.between(-180, 180)
+    )
+    coordinate_rows = int(valid.sum())
+
+    if coordinate_rows == 0:
+        status["message"] = "No valid latitude/longitude values remained after conversion."
+        return status
+
+    status["map_available"] = True
+    status["coordinate_rows"] = coordinate_rows
+    return status
+
+
 # -----------------------------
 # Question interpretation
 # -----------------------------
@@ -615,7 +770,9 @@ def parse_with_rules(question: str) -> Dict[str, Any]:
     q = question.lower()
     instructions = blank_instructions()
 
-    if any(word in q for word in ["map", "plot", "geographic", "where", "location", "locations"]):
+    if question_is_species_list_request(question):
+        instructions["intent"] = "species_list"
+    elif any(word in q for word in ["map", "plot", "geographic", "where", "location", "locations"]):
         instructions["intent"] = "map"
         instructions["make_map"] = True
     elif any(phrase in q for phrase in ["top species", "most common species", "common species"]):
@@ -684,7 +841,8 @@ Convert the question into this exact JSON structure:
   "limit": 1000
 }}
 
-Intent must be one of: summary, count, top_species, native_summary, diameter_summary, danger_summary, filter, map.
+Intent must be one of: summary, count, top_species, species_list, native_summary, diameter_summary, danger_summary, filter, map.
+Use species_list when the user asks what species are in the dataset or asks to list all tree species.
 Use intent count for "how many" questions.
 Use intent top_species for most common species.
 Use intent native_summary for native/introduced questions.
@@ -696,16 +854,13 @@ For native trees, set native_text to naturally_occurring.
 
 Question: {question}
 """
-    try:
-        response = ollama.chat(
-            model=model_name,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0, "num_predict": 180},
-        )
-        parsed = extract_json(response["message"]["content"].strip())
-        return parsed if isinstance(parsed, dict) else blank_instructions()
-    except Exception:
-        return blank_instructions()
+    text = safe_ollama_chat(
+        model_name,
+        prompt,
+        options={"temperature": 0, "num_predict": 180},
+    )
+    parsed = extract_json(text)
+    return parsed if isinstance(parsed, dict) else blank_instructions()
 
 
 def clean_instruction_value(value: Any) -> Any:
@@ -722,7 +877,11 @@ def interpret_question(question: str, schema: Dict[str, Any], model_name: str, u
     rule_instructions = parse_with_rules(question)
     model_instructions = ask_model_for_parse(question, schema, model_name) if use_model_parse else blank_instructions()
 
-    allowed_intents = {"summary", "count", "top_species", "native_summary", "diameter_summary", "danger_summary", "filter", "map"}
+    allowed_intents = {
+        "summary", "count", "top_species", "species_list", "native_summary",
+        "diameter_summary", "danger_summary", "filter", "map"
+    }
+
     merged = blank_instructions()
     merged.update(model_instructions or {})
 
@@ -934,6 +1093,7 @@ def build_result(
     filters: List[str],
     warnings: List[str],
     coord_rows: int,
+    map_status: Dict[str, Any],
     cache_hit: bool,
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any]]:
     roles = schema["roles"]
@@ -946,7 +1106,41 @@ def build_result(
     preview_df: Optional[pd.DataFrame] = None
     result_available = True
 
-    if warnings and any("native-status" in w for w in warnings) and intent == "native_summary":
+    display_count_label = "Matching records"
+    display_count_value = int(matching_rows)
+
+    if intent == "species_list" and roles.get("species_common"):
+        species_col = roles["species_common"]
+
+        table_df = (
+            filtered_df[species_col]
+            .dropna()
+            .astype(str)
+            .value_counts()
+            .reset_index()
+        )
+        table_df.columns = ["Species", "Count"]
+
+        unique_species = int(len(table_df))
+        display_count_label = "Unique species"
+        display_count_value = unique_species
+
+        if unique_species > 0:
+            top_rows = table_df.head(5)
+            top_parts = [
+                f"{row['Species']} ({int(row['Count']):,})"
+                for _, row in top_rows.iterrows()
+            ]
+
+            verified_summary = (
+                f"The dataset contains {unique_species:,} unique tree species/common names "
+                f"across {matching_rows:,} tree records. "
+                f"The most common species are {', '.join(top_parts)}."
+            )
+        else:
+            verified_summary = "I could not find any species/common-name values in this dataset."
+
+    elif warnings and any("native-status" in w for w in warnings) and intent == "native_summary":
         result_available = False
         table_df = pd.DataFrame([
             {"Item": "Native-status column", "Result": "Not found in this CSV"},
@@ -1004,8 +1198,15 @@ def build_result(
     if warnings:
         verified_summary += " " + " ".join(warnings)
 
-    if instructions.get("make_map") and coord_rows == 0:
-        verified_summary += " A map was requested, but this CSV has no usable coordinate values."
+    map_requested = bool(instructions.get("make_map"))
+    map_available = bool(map_status.get("map_available"))
+    map_status_message = map_status.get("message")
+
+    if map_requested and not map_available:
+        if map_status_message:
+            verified_summary += " A map was requested, but it was not created: " + str(map_status_message)
+        else:
+            verified_summary += " A map was requested, but it was not created because no usable coordinates were found."
 
     payload = {
         "question": question,
@@ -1014,11 +1215,16 @@ def build_result(
         "matching_record_count": int(matching_rows),
         "total_dataset_rows": int(total_rows),
         "percent_of_dataset": percent,
+        "display_count_label": display_count_label,
+        "display_count_value": display_count_value,
         "filters_used": filters,
         "warnings": warnings,
         "verified_summary": verified_summary,
         "important_table": table_df.to_dict(orient="records") if table_df is not None else [],
-        "map_requested": bool(instructions.get("make_map")),
+        "map_requested": map_requested,
+        "map_available": map_available,
+        "map_status_message": map_status_message,
+        "coordinate_rows_in_result": int(map_status.get("coordinate_rows", 0)),
         "coordinate_rows_in_dataset": int(coord_rows),
         "coordinate_kind": schema.get("coordinate_kind"),
         "cache_hit": cache_hit,
@@ -1032,28 +1238,55 @@ def build_result(
 # -----------------------------
 
 def explain_general_chat(prompt: str, model_name: str, use_model_explanation: bool) -> str:
-    fallback = "I’m ready to help with the tree dataset. You can ask me to count, summarize, filter, or map trees."
+    q = prompt.lower().strip()
+
+    if any(word in q for word in ["hi", "hello", "hey"]) and len(q.split()) <= 4:
+        return f"Hi. What would you like to explore in {APP_NAME}?"
+
+    if "how is your day" in q or "how are you" in q:
+        return "I’m doing well. I’m ready to help with the tree dataset whenever you are."
+
+    if any(phrase in q for phrase in ["who are you", "what are you", "what is this", "what app is this"]):
+        return (
+            f"I'm the chat assistant for {APP_NAME}, {APP_DESCRIPTION} "
+            "I can answer casual questions too, but my main job is helping you work with forestry and tree-related data."
+        )
+
+    if any(phrase in q for phrase in ["what can you do", "what do you do", "help me", "everything i can do", "tell me everything"]):
+        return (
+            "You can ask me to summarize datasets, count trees, list species, filter records by species or traits, "
+            "preview matching rows, and map tree or forestry data when usable coordinates are available."
+        )
+
+    if "favorite pokemon" in q or "favourite pokemon" in q:
+        return "I do not have personal favorites, but Pikachu is probably the classic answer."
+
+    fallback = "I can answer normally too, but I’m mainly set up to help you explore, summarize, filter, and map this tree dataset."
+
+    fallback = f"I can answer normally too, but I am mainly set up to help you explore, summarize, filter, and map forestry and tree datasets in {APP_NAME}."
 
     if not use_model_explanation:
         return fallback
 
     system_prompt = f"""
-You are a helpful assistant inside a local tree-data demo app.
-The user may casually chat with you, but you should not pretend to analyze the CSV unless they ask a data question.
-Answer in 1 to 2 sentences.
-If useful, mention that you can help count, summarize, filter, or map trees.
-User message: {prompt}
+You are a helpful assistant inside {APP_NAME}, {APP_DESCRIPTION}
+The user is casually chatting, not asking for data analysis.
+Answer naturally in 1 to 2 short sentences.
+Do not mention querying the CSV unless the user asks about the dataset.
+Do not describe the app as a programming, binary-tree, heap, or data-structures tool.
+Do not pretend to have personal experiences.
+
+User message:
+{prompt}
 """
-    try:
-        response = ollama.chat(
-            model=model_name,
-            messages=[{"role": "user", "content": system_prompt}],
-            options={"temperature": 0.3, "num_predict": 120},
-        )
-        text = response["message"]["content"].strip()
-        return text if text else fallback
-    except Exception:
-        return fallback
+
+    text = safe_ollama_chat(
+        model_name,
+        system_prompt,
+        options={"temperature": 0.4, "num_predict": 140},
+    )
+
+    return text if text else fallback
 
 
 def explain_result(
@@ -1062,6 +1295,20 @@ def explain_result(
     use_model_explanation: bool,
     selected_projected_crs: Optional[str],
 ) -> str:
+    if payload.get("intent") == "species_list":
+        return payload["verified_summary"]
+
+    map_requested = bool(payload.get("map_requested"))
+    map_available = bool(payload.get("map_available"))
+
+    if map_requested and not map_available:
+        return payload["verified_summary"]
+
+    if not use_model_explanation:
+        if map_requested:
+            return "Here's your map. " + payload["verified_summary"]
+        return payload["verified_summary"]
+
     if not use_model_explanation:
         if payload.get("map_requested"):
             return "Here’s your map. " + payload["verified_summary"]
@@ -1069,14 +1316,17 @@ def explain_result(
 
     user_facing_payload = {
         "question": payload["question"],
+        "intent": payload["intent"],
         "result_available": payload["result_available"],
         "matching_record_count": payload["matching_record_count"],
         "total_dataset_rows": payload["total_dataset_rows"],
         "percent_of_dataset": payload["percent_of_dataset"],
+        "display_count_label": payload.get("display_count_label"),
+        "display_count_value": payload.get("display_count_value"),
         "filters_used": payload["filters_used"],
         "warnings": payload["warnings"],
         "verified_summary": payload["verified_summary"],
-        "important_table": payload["important_table"],
+        "important_table": payload["important_table"][:10],
     }
 
     if payload.get("map_requested"):
@@ -1089,6 +1339,17 @@ def explain_result(
             user_facing_payload["map_note"] = (
                 f"A map was requested. Coordinate rows available: {payload['coordinate_rows_in_dataset']}. "
                 "A coordinate system must be selected before these coordinates can be mapped."
+            )
+
+    if map_requested and map_available:
+        if payload.get("coordinate_kind") == "projected_crs_required" and selected_projected_crs:
+            user_facing_payload["map_note"] = (
+                f"A map was created for {payload.get('coordinate_rows_in_result', 0)} matching rows. "
+                f"The app transformed the coordinate values using {selected_projected_crs} so they can be displayed on the map."
+            )
+        else:
+            user_facing_payload["map_note"] = (
+                f"A map was created for {payload.get('coordinate_rows_in_result', 0)} matching rows with usable coordinates."
             )
 
     if payload.get("map_requested"):
@@ -1105,7 +1366,7 @@ Do not repeat the user's question.
 """
 
     prompt = f"""
-Use only the verified facts below. Write 2 to 4 plain-English sentences for a nontechnical supervisor.
+Use only the verified facts below. Write 2 to 4 plain-English sentences.
 Do not invent facts. Do not recalculate numbers. Do not mention JSON or internal fields.
 If a map note is present, explain it in simple terms.
 {instruction}
@@ -1113,62 +1374,153 @@ If a map note is present, explain it in simple terms.
 Verified facts:
 {json.dumps(user_facing_payload, indent=2)}
 """
-    try:
-        response = ollama.chat(
-            model=model_name,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.2, "num_predict": 220},
-        )
-        text = response["message"]["content"].strip()
-        lowered = text.lower()
 
-        forbidden = [
-            "over 99%",
-            "almost all",
-            "forest surveyed",
-            "map_requested",
-            "json",
-            "coordinate information is not available",
-            "coordinates are not available",
-            "coordinate data is not available",
-        ]
+    text = safe_ollama_chat(
+        model_name,
+        prompt,
+        options={"temperature": 0.2, "num_predict": 220},
+    )
 
-        if not payload.get("map_requested"):
-            forbidden.extend(["coordinate data", "coordinate rows", "missing coordinate"])
-
-        if any(term in lowered for term in forbidden):
-            if payload.get("map_requested"):
-                return "Here’s your map. " + payload["verified_summary"]
-            return payload["verified_summary"]
-
-        if payload.get("result_available"):
-            count_text = str(payload["matching_record_count"])
-            if count_text not in text.replace(",", ""):
-                if payload.get("map_requested"):
-                    return "Here’s your map. " + payload["verified_summary"]
-                return payload["verified_summary"]
-
-        if payload.get("map_requested") and "map" not in lowered:
-            return "Here’s your map. " + text
-
-        return text
-
-    except Exception:
+    if not text:
         if payload.get("map_requested"):
             return "Here’s your map. " + payload["verified_summary"]
         return payload["verified_summary"]
+
+    lowered = text.lower()
+
+    forbidden = [
+        "over 99%",
+        "almost all",
+        "forest surveyed",
+        "map_requested",
+        "json",
+        "coordinate information is not available",
+        "coordinates are not available",
+        "coordinate data is not available",
+    ]
+
+    if not payload.get("map_requested"):
+        forbidden.extend(["coordinate data", "coordinate rows", "missing coordinate"])
+
+    if any(term in lowered for term in forbidden):
+        if payload.get("map_requested"):
+            return "Here’s your map. " + payload["verified_summary"]
+        return payload["verified_summary"]
+
+    if payload.get("map_requested") and "map" not in lowered:
+        return "Here’s your map. " + text
+
+    return text
 
 
 # -----------------------------
 # Map creation
 # -----------------------------
 
-def make_map(
+def add_map_tile_layers(m: folium.Map, selected_map_style: str) -> None:
+    if selected_map_style not in MAP_TILE_OPTIONS:
+        selected_map_style = "Standard"
+
+    for style_name, config in MAP_TILE_OPTIONS.items():
+        tile_kwargs = {
+            "tiles": config["tiles"],
+            "name": style_name,
+            "show": style_name == selected_map_style,
+            "control": True,
+        }
+
+        if config.get("attr"):
+            tile_kwargs["attr"] = config["attr"]
+
+        folium.TileLayer(**tile_kwargs).add_to(m)
+
+    folium.LayerControl(position="topright", collapsed=False).add_to(m)
+
+
+def add_polygon_draw_control(m: folium.Map) -> None:
+    Draw(
+        export=False,
+        draw_options={
+            "polyline": False,
+            "circle": False,
+            "circlemarker": False,
+            "marker": False,
+            "polygon": True,
+            "rectangle": True,
+        },
+        edit_options={
+            "edit": True,
+            "remove": True,
+        },
+    ).add_to(m)
+
+
+def point_in_polygon(lat: float, lon: float, ring: List[List[float]]) -> bool:
+    x = lon
+    y = lat
+    inside = False
+    j = len(ring) - 1
+
+    for i in range(len(ring)):
+        xi, yi = ring[i][0], ring[i][1]
+        xj, yj = ring[j][0], ring[j][1]
+
+        intersects = ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi
+        )
+
+        if intersects:
+            inside = not inside
+
+        j = i
+
+    return inside
+
+
+def polygon_rings_from_drawings(drawings: Any) -> List[List[List[float]]]:
+    rings: List[List[List[float]]] = []
+
+    for feature in drawings or []:
+        geometry = feature.get("geometry", {}) if isinstance(feature, dict) else {}
+        geometry_type = geometry.get("type")
+        coordinates = geometry.get("coordinates", [])
+
+        if geometry_type == "Polygon" and coordinates:
+            rings.append(coordinates[0])
+        elif geometry_type == "MultiPolygon":
+            for polygon in coordinates:
+                if polygon:
+                    rings.append(polygon[0])
+
+    return rings
+
+
+def select_rows_inside_drawings(map_df: pd.DataFrame, drawings: Any) -> Optional[pd.DataFrame]:
+    rings = polygon_rings_from_drawings(drawings)
+
+    if not rings:
+        return None
+
+    selected_mask = pd.Series(False, index=map_df.index)
+
+    for ring in rings:
+        if len(ring) < 3:
+            continue
+
+        selected_mask = selected_mask | map_df.apply(
+            lambda row: point_in_polygon(float(row["__map_lat"]), float(row["__map_lon"]), ring),
+            axis=1,
+        )
+
+    return map_df[selected_mask].copy()
+
+
+def prepare_map_dataframe(
     df: pd.DataFrame,
     schema: Dict[str, Any],
-    popup_cols: List[Optional[str]],
     selected_projected_crs: Optional[str],
-) -> Tuple[Optional[folium.Map], Optional[str]]:
+    sample_limit: Optional[int] = None,
+) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     roles = schema["roles"]
     lat_col = roles.get("latitude")
     lon_col = roles.get("longitude")
@@ -1180,9 +1532,6 @@ def make_map(
 
     if len(map_df) == 0:
         return None, "No rows have usable coordinate values."
-
-    if len(map_df) > 1000:
-        map_df = map_df.sample(1000, random_state=42)
 
     lat_values, lon_values, error = get_map_coordinates(
         map_df,
@@ -1202,11 +1551,48 @@ def make_map(
     map_df["__map_lat"] = lat_values
     map_df["__map_lon"] = lon_values
     map_df = map_df.dropna(subset=["__map_lat", "__map_lon"])
+    map_df = map_df[
+        map_df["__map_lat"].between(-90, 90)
+        & map_df["__map_lon"].between(-180, 180)
+    ]
 
     if len(map_df) == 0:
         return None, "No valid coordinates remained after conversion."
 
-    m = folium.Map(location=[map_df["__map_lat"].mean(), map_df["__map_lon"].mean()], zoom_start=16)
+    if sample_limit is not None and len(map_df) > sample_limit:
+        map_df = map_df.sample(sample_limit, random_state=42)
+
+    return map_df, None
+
+
+def make_map(
+    df: pd.DataFrame,
+    schema: Dict[str, Any],
+    popup_cols: List[Optional[str]],
+    selected_projected_crs: Optional[str],
+    selected_map_style: str,
+) -> Tuple[Optional[folium.Map], Optional[str]]:
+    map_df, error = prepare_map_dataframe(
+        df,
+        schema,
+        selected_projected_crs,
+        sample_limit=1000,
+    )
+
+    if error:
+        return None, error
+
+    if map_df is None:
+        return None, "Could not prepare coordinates for mapping."
+
+    m = folium.Map(
+        location=[map_df["__map_lat"].mean(), map_df["__map_lon"].mean()],
+        zoom_start=16,
+        tiles=None,
+        control_scale=True,
+    )
+    add_map_tile_layers(m, selected_map_style)
+    add_polygon_draw_control(m)
 
     for _, row in map_df.iterrows():
         popup_text = []
@@ -1269,8 +1655,12 @@ def render_assistant_results(
     active_chat_id: str,
     message_index: int,
     selected_projected_crs: Optional[str],
+    selected_map_style: str,
 ) -> None:
     for result_index, result in enumerate(results):
+        if result_index > 0:
+            st.divider()
+
         if result.get("type") == "general_chat":
             st.write(result["content"])
             continue
@@ -1294,32 +1684,94 @@ def render_assistant_results(
                 result_roles.get("height_numeric"),
             ]
 
-            map_schema = {
-                "roles": result_roles,
-                "coordinate_kind": coordinate_kind,
-            }
+            if not payload.get("map_available"):
+                st.warning(payload.get("map_status_message") or "No usable coordinates were found.")
+            else:
+                map_schema = {
+                    "roles": result_roles,
+                    "coordinate_kind": coordinate_kind,
+                }
 
-            m, error = make_map(
-                filtered_df,
-                map_schema,
-                popup_cols,
-                selected_projected_crs,
-            )
-
-            if error:
-                st.warning(error)
-            elif m is not None:
-                st_folium(
-                    m,
-                    width=1000,
-                    height=600,
-                    key=f"map::{csv_name}::{active_chat_id}::{message_index}::{result_index}",
-                    returned_objects=[],
+                m, error = make_map(
+                    filtered_df,
+                    map_schema,
+                    popup_cols,
+                    selected_projected_crs,
+                    selected_map_style,
                 )
+
+                if error:
+                    st.warning(error)
+                elif m is not None:
+                    map_output = st_folium(
+                        m,
+                        width=1000,
+                        height=600,
+                        key=f"map::{csv_name}::{active_chat_id}::{message_index}::{result_index}",
+                        returned_objects=["all_drawings"],
+                    )
+
+                    selected_df = None
+                    if map_output and map_output.get("all_drawings"):
+                        full_map_df, selection_error = prepare_map_dataframe(
+                            filtered_df,
+                            map_schema,
+                            selected_projected_crs,
+                        )
+
+                        if selection_error:
+                            st.warning(selection_error)
+                        elif full_map_df is not None:
+                            selected_df = select_rows_inside_drawings(
+                                full_map_df,
+                                map_output.get("all_drawings"),
+                            )
+
+                    if selected_df is not None:
+                        st.write(f"Records inside drawn area: {len(selected_df):,}")
+
+                        species_col = result_roles.get("species_common")
+                        if species_col and species_col in selected_df.columns and len(selected_df) > 0:
+                            species_summary = (
+                                selected_df[species_col]
+                                .dropna()
+                                .astype(str)
+                                .value_counts()
+                                .head(20)
+                                .reset_index()
+                            )
+                            species_summary.columns = ["Species", "Count"]
+
+                            with st.expander("Species inside drawn area", expanded=False):
+                                st.dataframe(species_summary, use_container_width=True)
+
+                        display_cols = [
+                            col for col in [
+                                result_roles.get("species_common"),
+                                result_roles.get("scientific_name"),
+                                result_roles.get("diameter_numeric"),
+                                result_roles.get("height_numeric"),
+                                result_roles.get("latitude"),
+                                result_roles.get("longitude"),
+                            ]
+                            if col and col in selected_df.columns
+                        ]
+
+                        with st.expander("Rows inside drawn area", expanded=False):
+                            if display_cols:
+                                st.dataframe(selected_df[display_cols].head(1000), use_container_width=True)
+                            else:
+                                st.dataframe(selected_df.head(1000), use_container_width=True)
 
         with st.expander("Data result", expanded=False):
             if payload.get("result_available"):
-                st.write(f"Matching records: {len(filtered_df):,}")
+                label = payload.get("display_count_label", "Matching records")
+                value = payload.get("display_count_value", len(filtered_df))
+
+                st.write(f"{label}: {value:,}")
+
+                if payload.get("intent") == "species_list":
+                    st.caption(f"Tree records checked: {len(filtered_df):,}")
             else:
                 st.write("Matching records: not applicable")
 
@@ -1345,10 +1797,21 @@ def render_assistant_results(
 # Streamlit UI
 # -----------------------------
 
-st.set_page_config(page_title="Tree AI Demo", layout="wide")
+st.set_page_config(page_title=APP_NAME, layout="wide")
 
-st.title("Tree AI Demo")
-st.write("Ask questions about a tree CSV. The app queries the data, explains the answer, and can map results when coordinates are usable.")
+if st.session_state.get("app_state_version") != APP_STATE_VERSION:
+    for key in list(st.session_state.keys()):
+        if (
+            key.startswith("pending_chat::")
+            or key.startswith("pending_schema_question::")
+            or key.startswith("last_filter::")
+            or key == "last_general_chat_error"
+        ):
+            del st.session_state[key]
+    st.session_state["app_state_version"] = APP_STATE_VERSION
+
+st.title(APP_NAME)
+st.write("Ask questions across forestry, tree inventory, and spatial datasets. The app answers from the selected data and maps results when coordinates are usable.")
 
 csv_files = get_tree_csv_files()
 
@@ -1360,19 +1823,26 @@ csv_choice = st.sidebar.selectbox("Dataset", csv_files, format_func=lambda x: x.
 df = load_csv(csv_choice)
 
 models = get_installed_ollama_models()
-preferred_order = ["qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b", "qwen2.5:3b"]
+question_preferred_order = ["qwen2.5:3b", "qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b"]
+schema_preferred_order = ["qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b", "qwen2.5:3b"]
 
-default_model = models[0] if models else "qwen2.5:3b"
-for preferred in preferred_order:
+question_default_model = models[0] if models else "qwen2.5:3b"
+for preferred in question_preferred_order:
     if preferred in models:
-        default_model = preferred
+        question_default_model = preferred
+        break
+
+schema_default_model = models[0] if models else "qwen2.5:3b"
+for preferred in schema_preferred_order:
+    if preferred in models:
+        schema_default_model = preferred
         break
 
 if "question_model" not in st.session_state or st.session_state["question_model"] not in models:
-    st.session_state["question_model"] = default_model
+    st.session_state["question_model"] = question_default_model
 
 if "schema_model" not in st.session_state or st.session_state["schema_model"] not in models:
-    st.session_state["schema_model"] = default_model
+    st.session_state["schema_model"] = schema_default_model
 
 if "use_model_parse" not in st.session_state:
     st.session_state["use_model_parse"] = True
@@ -1414,10 +1884,17 @@ if st.session_state[crs_key].startswith("EPSG:32617"):
 elif st.session_state[crs_key].startswith("EPSG:26917"):
     selected_projected_crs = "EPSG:26917"
 
+selected_map_style = "Standard"
+
 chats_key, chats, active_chat_id = init_chat_state(csv_choice.name)
 
 if st.sidebar.button("New chat", use_container_width=True):
     create_new_chat(csv_choice.name)
+    st.rerun()
+
+if st.sidebar.button("Clear current chat", use_container_width=True):
+    st.session_state[chats_key][active_chat_id]["messages"] = []
+    st.session_state[chats_key][active_chat_id]["title"] = "New chat"
     st.rerun()
 
 chat_ids = list(st.session_state[chats_key].keys())
@@ -1446,7 +1923,6 @@ refine_future_key = f"schema_refine_future::{csv_choice.name}"
 refine_model_key = f"schema_refine_model::{csv_choice.name}"
 refine_error_key = f"schema_refine_error::{csv_choice.name}"
 pending_schema_question_key = f"pending_schema_question::{csv_choice.name}"
-pending_chat_key = f"pending_chat::{csv_choice.name}::{active_chat_id}"
 
 refine_running = (
     refine_future_key in st.session_state
@@ -1482,12 +1958,14 @@ refine_running = (
 schema = st.session_state[schema_key]
 roles = schema["roles"]
 schema_method = schema.get("schema_method", "rules_only")
+dataset_map_status = get_map_status(df, schema, selected_projected_crs)
+coord_rows = int(dataset_map_status.get("coordinate_rows", 0))
 
 if refine_running and st_autorefresh is not None:
     st_autorefresh(interval=2000, key=f"schema_refine_poll::{csv_choice.name}")
 
 with st.sidebar.expander("Advanced options", expanded=False):
-    st.markdown("### AI model")
+    st.markdown("### Question answering")
 
     with st.form("model_settings_form"):
         question_model_choice = st.selectbox(
@@ -1496,23 +1974,25 @@ with st.sidebar.expander("Advanced options", expanded=False):
             index=models.index(st.session_state["question_model"]) if st.session_state["question_model"] in models else 0,
         )
 
-        schema_model_choice = st.selectbox(
-            "Schema refinement model",
-            models,
-            index=models.index(st.session_state["schema_model"]) if st.session_state["schema_model"] in models else 0,
-        )
-
         parse_choice = st.checkbox(
             "Use model for question interpretation",
             value=st.session_state["use_model_parse"],
         )
 
         explanation_choice = st.checkbox(
-            "Use model for explanation",
+            "Use model for data explanation",
             value=st.session_state["use_model_explanation"],
         )
 
-        settings_submitted = st.form_submit_button("Apply model settings")
+        st.markdown("### Dataset setup")
+
+        schema_model_choice = st.selectbox(
+            "Schema refinement model",
+            models,
+            index=models.index(st.session_state["schema_model"]) if st.session_state["schema_model"] in models else 0,
+        )
+
+        settings_submitted = st.form_submit_button("Apply settings")
 
     if settings_submitted:
         st.session_state["question_model"] = question_model_choice
@@ -1536,7 +2016,7 @@ with st.sidebar.expander("Advanced options", expanded=False):
         ),
     )
 
-    st.markdown("### Dataset setup")
+    st.markdown("### Dataset setup status")
 
     if refine_running:
         running_model = st.session_state.get(refine_model_key, "selected model")
@@ -1602,11 +2082,16 @@ coordinate_label = get_coordinate_display_label(
     selected_projected_crs,
 )
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Rows", f"{len(df):,}")
-c2.metric("Columns", len(df.columns))
-c3.metric("Rows with coordinates", f"{coord_rows:,}")
-c4.metric("Coordinate status", coordinate_label)
+if coord_rows > 0:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", f"{len(df):,}")
+    c2.metric("Columns", len(df.columns))
+    c3.metric("Rows with coordinates", f"{coord_rows:,}")
+    c4.metric("Coordinate status", coordinate_label)
+else:
+    c1, c2 = st.columns(2)
+    c1.metric("Rows", f"{len(df):,}")
+    c2.metric("Columns", len(df.columns))
 
 coordinate_note = get_coordinate_note(schema.get("coordinate_kind", "none"), selected_projected_crs)
 if coordinate_note:
@@ -1636,6 +2121,9 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
 
         instructions = interpret_question(question, schema, model_name, use_model_parse)
 
+        if question_is_species_list_request(question):
+            instructions["intent"] = "species_list"
+
         if question_is_map_request(question):
             instructions["intent"] = "map"
             instructions["make_map"] = True
@@ -1654,6 +2142,20 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
             instructions,
         )
 
+        if instructions.get("make_map"):
+            result_map_status = get_map_status(
+                filtered_df,
+                schema,
+                selected_projected_crs,
+            )
+        else:
+            result_map_status = {
+                "map_available": False,
+                "coordinate_rows": 0,
+                "message": None,
+                "coordinate_kind": schema.get("coordinate_kind", "none"),
+            }
+
         table_df, preview_df, payload = build_result(
             df=df,
             filtered_df=filtered_df,
@@ -1663,6 +2165,7 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
             filters=filters,
             warnings=warnings,
             coord_rows=coord_rows,
+            map_status=result_map_status,
             cache_hit=cache_hit,
         )
 
@@ -1715,35 +2218,31 @@ for message_index, message in enumerate(messages):
                     active_chat_id,
                     message_index,
                     selected_projected_crs,
+                    selected_map_style,
                 )
 
 if not refine_running and pending_schema_question_key in st.session_state:
     queued_question = st.session_state[pending_schema_question_key]
     del st.session_state[pending_schema_question_key]
 
-    with st.spinner("Dataset setup finished. Answering your queued question..."):
-        messages.append({
-            "role": "assistant",
-            "results": compute_results_for_query(queued_question),
-        })
-
-    st.rerun()
-
-if pending_chat_key in st.session_state and not refine_running:
-    pending_prompt = st.session_state[pending_chat_key]
-    del st.session_state[pending_chat_key]
-
-    with st.spinner("Thinking..."):
-        results = compute_results_for_query(pending_prompt)
+    with st.chat_message("assistant"):
+        with st.spinner("Dataset setup finished. Answering your queued question..."):
+            results = compute_results_for_query(queued_question)
+            render_assistant_results(
+                results,
+                csv_choice.name,
+                active_chat_id,
+                len(messages),
+                selected_projected_crs,
+                selected_map_style,
+            )
 
     messages.append({
         "role": "assistant",
         "results": results,
     })
 
-    st.rerun()
-
-prompt = st.chat_input("Ask about the tree dataset...")
+prompt = st.chat_input("Ask about your forestry or spatial data...")
 
 if prompt:
     cleaned_prompt = normalize_prompt(prompt)
@@ -1760,13 +2259,36 @@ if prompt:
             title = title[:37] + "..."
         st.session_state[chats_key][active_chat_id]["title"] = title
 
+    with st.chat_message("user"):
+        st.write(cleaned_prompt)
+
     if refine_running:
+        queued_message = "Dataset setup is still running. I queued your question and will answer it when setup finishes."
         st.session_state[pending_schema_question_key] = cleaned_prompt
+
         messages.append({
             "role": "assistant",
-            "content": "Dataset setup is still running. I queued your question and will answer it when setup finishes.",
+            "content": queued_message,
         })
-        st.rerun()
 
-    st.session_state[pending_chat_key] = cleaned_prompt
-    st.rerun()
+        with st.chat_message("assistant"):
+            st.write(queued_message)
+
+    else:
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                results = compute_results_for_query(cleaned_prompt)
+
+            render_assistant_results(
+                results,
+                csv_choice.name,
+                active_chat_id,
+                len(messages),
+                selected_projected_crs,
+                selected_map_style,
+            )
+
+        messages.append({
+            "role": "assistant",
+            "results": results,
+        })
