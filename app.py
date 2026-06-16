@@ -282,6 +282,51 @@ def question_is_species_list_request(question: str) -> bool:
     return any(phrase in q for phrase in species_list_phrases)
 
 
+def make_suggested_questions(df: pd.DataFrame, schema: Dict[str, Any], coord_rows: int) -> List[str]:
+    roles = schema.get("roles", {})
+    suggestions: List[str] = ["Summarize this dataset"]
+
+    species_col = roles.get("species_common")
+    top_species: Optional[str] = None
+
+    if species_col and species_col in df.columns:
+        species_counts = df[species_col].dropna().astype(str).str.strip()
+        species_counts = species_counts[species_counts != ""]
+
+        if len(species_counts) > 0:
+            top_species = str(species_counts.value_counts().index[0])
+
+        suggestions.extend([
+            "What are the most common species?",
+            "List every species in the dataset",
+        ])
+
+        if top_species:
+            suggestions.append(f"How many {top_species} trees are there?")
+
+    if roles.get("danger_flag"):
+        suggestions.append("Which trees are marked hazardous?")
+
+    if roles.get("diameter_numeric") or roles.get("diameter_bin"):
+        suggestions.append("Summarize tree diameter classes")
+
+    if roles.get("native_status"):
+        suggestions.append("Summarize native and introduced trees")
+
+    if coord_rows > 0:
+        suggestions.append("Map all trees")
+
+        if top_species:
+            suggestions.append(f"Map {top_species} trees")
+
+    deduped: List[str] = []
+    for suggestion in suggestions:
+        if suggestion not in deduped:
+            deduped.append(suggestion)
+
+    return deduped[:8]
+
+
 def is_followup_prompt(question: str) -> bool:
     q = question.lower()
     return any(word in q for word in FOLLOWUP_WORDS)
@@ -1084,6 +1129,27 @@ def make_diameter_table(df: pd.DataFrame, schema: Dict[str, Any]) -> Tuple[Optio
     return None, "I could not find a diameter/DBH column in this CSV."
 
 
+def describe_top_values(df: pd.DataFrame, col: Optional[str], label: str, limit: int = 5) -> Tuple[Optional[str], Optional[pd.DataFrame]]:
+    if not col or col not in df.columns:
+        return None, None
+
+    values = df[col].dropna().astype(str).str.strip()
+    values = values[values != ""]
+
+    if len(values) == 0:
+        return None, None
+
+    table = values.value_counts().head(limit).reset_index()
+    table.columns = [label, "Count"]
+
+    parts = [
+        f"{row[label]} ({int(row['Count']):,})"
+        for _, row in table.iterrows()
+    ]
+
+    return ", ".join(parts), table
+
+
 def build_result(
     df: pd.DataFrame,
     filtered_df: pd.DataFrame,
@@ -1135,7 +1201,8 @@ def build_result(
             verified_summary = (
                 f"The dataset contains {unique_species:,} unique tree species/common names "
                 f"across {matching_rows:,} tree records. "
-                f"The most common species are {', '.join(top_parts)}."
+                f"The most common species are {', '.join(top_parts)}. "
+                "The full species list is shown below."
             )
         else:
             verified_summary = "I could not find any species/common-name values in this dataset."
@@ -1182,6 +1249,57 @@ def build_result(
         table_df = filtered_df[danger_col].astype(str).value_counts().reset_index()
         table_df.columns = ["Danger flag", "Count"]
         verified_summary = f"The danger/hazard summary used the {danger_col} field. There are {matching_rows:,} matching records out of {total_rows:,} total records."
+
+    elif intent == "summary":
+        summary_rows = [
+            {"Metric": "Rows", "Value": f"{total_rows:,}"},
+            {"Metric": "Columns", "Value": f"{len(df.columns):,}"},
+        ]
+        summary_parts = [
+            f"This dataset contains {total_rows:,} tree records across {len(df.columns):,} columns."
+        ]
+
+        species_text, species_table = describe_top_values(filtered_df, roles.get("species_common"), "Species")
+        if species_table is not None:
+            unique_species = int(filtered_df[roles["species_common"]].dropna().astype(str).str.strip().nunique())
+            summary_rows.append({"Metric": "Unique species/common names", "Value": f"{unique_species:,}"})
+            summary_rows.append({"Metric": "Most common species", "Value": species_text or "Not available"})
+            summary_parts.append(f"It includes {unique_species:,} unique species/common names; the most common are {species_text}.")
+
+        scientific_text, _ = describe_top_values(filtered_df, roles.get("scientific_name"), "Scientific name", limit=3)
+        if scientific_text:
+            summary_rows.append({"Metric": "Top scientific names", "Value": scientific_text})
+
+        diameter_col = roles.get("diameter_numeric")
+        if diameter_col and diameter_col in filtered_df.columns:
+            diameter_values = pd.to_numeric(filtered_df[diameter_col], errors="coerce").dropna()
+            if len(diameter_values) > 0:
+                summary_rows.append({"Metric": f"Median {diameter_col}", "Value": f"{diameter_values.median():.1f}"})
+                summary_rows.append({"Metric": f"Maximum {diameter_col}", "Value": f"{diameter_values.max():.1f}"})
+                summary_parts.append(f"The median {diameter_col} is {diameter_values.median():.1f}, with a maximum of {diameter_values.max():.1f}.")
+
+        native_text, _ = describe_top_values(filtered_df, roles.get("native_status"), "Native status", limit=4)
+        if native_text:
+            summary_rows.append({"Metric": "Native status values", "Value": native_text})
+
+        danger_col = roles.get("danger_flag")
+        if danger_col and danger_col in filtered_df.columns:
+            danger_values = pd.to_numeric(filtered_df[danger_col], errors="coerce")
+            danger_count = int((danger_values == 1).sum())
+            summary_rows.append({"Metric": "Marked hazardous/danger", "Value": f"{danger_count:,}"})
+            if danger_count > 0:
+                summary_parts.append(f"{danger_count:,} records are marked as hazardous/danger.")
+
+        if coord_rows > 0:
+            summary_rows.append({"Metric": "Rows with usable coordinates", "Value": f"{coord_rows:,}"})
+            summary_parts.append(f"{coord_rows:,} records have usable coordinates for mapping.")
+        else:
+            summary_rows.append({"Metric": "Rows with usable coordinates", "Value": "0"})
+            summary_parts.append("No usable coordinate fields were detected for mapping in this dataset.")
+
+        table_df = pd.DataFrame(summary_rows)
+        preview_df = filtered_df.head(int(instructions.get("limit", 1000))) if matching_rows > 0 else None
+        verified_summary = " ".join(summary_parts)
 
     else:
         table_df = pd.DataFrame([
@@ -1649,6 +1767,22 @@ def create_new_chat(csv_name: str) -> None:
     st.session_state[active_key] = new_id
 
 
+def render_suggested_question_buttons(suggestions: List[str], key_prefix: str) -> Optional[str]:
+    if not suggestions:
+        return None
+
+    st.caption("Suggested questions")
+    selected_question = None
+    columns = st.columns(2)
+
+    for index, suggestion in enumerate(suggestions):
+        with columns[index % 2]:
+            if st.button(suggestion, key=f"{key_prefix}::{index}", use_container_width=True):
+                selected_question = suggestion
+
+    return selected_question
+
+
 def render_assistant_results(
     results: List[Dict[str, Any]],
     csv_name: str,
@@ -1675,6 +1809,21 @@ def render_assistant_results(
         coordinate_kind = result.get("coordinate_kind", "none")
 
         st.write(explanation)
+
+        if payload.get("intent") == "species_list" and table_df is not None:
+            st.dataframe(
+                table_df,
+                use_container_width=True,
+                height=420,
+                hide_index=True,
+            )
+            st.download_button(
+                "Download species list",
+                data=table_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"{csv_name}_species_list.csv",
+                mime="text/csv",
+                key=f"species-download::{csv_name}::{active_chat_id}::{message_index}::{result_index}",
+            )
 
         if instructions.get("make_map") or instructions.get("intent") == "map":
             popup_cols = [
@@ -1778,7 +1927,7 @@ def render_assistant_results(
             if payload.get("cache_hit"):
                 st.caption("Reused cached query result.")
 
-            if table_df is not None:
+            if table_df is not None and payload.get("intent") != "species_list":
                 st.dataframe(table_df, use_container_width=True)
 
             if preview_df is not None:
@@ -2242,10 +2391,17 @@ if not refine_running and pending_schema_question_key in st.session_state:
         "results": results,
     })
 
+suggested_prompt = render_suggested_question_buttons(
+    make_suggested_questions(df, schema, coord_rows),
+    f"suggested::{csv_choice.name}::{active_chat_id}",
+)
+
 prompt = st.chat_input("Ask about your forestry or spatial data...")
 
-if prompt:
-    cleaned_prompt = normalize_prompt(prompt)
+active_prompt = suggested_prompt or prompt
+
+if active_prompt:
+    cleaned_prompt = normalize_prompt(active_prompt)
 
     messages.append({
         "role": "user",
