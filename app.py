@@ -1150,6 +1150,48 @@ def describe_top_values(df: pd.DataFrame, col: Optional[str], label: str, limit:
     return ", ".join(parts), table
 
 
+def humanize_text(value: Any) -> str:
+    text = safe_string(value)
+
+    if not text:
+        return ""
+
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def describe_query_subject(instructions: Dict[str, Any], filters: List[str]) -> str:
+    species_text = humanize_text(instructions.get("species_text"))
+    native_text = humanize_text(instructions.get("native_text"))
+
+    if instructions.get("danger_value") is not None:
+        return "hazardous trees"
+
+    if species_text:
+        return f"{species_text} trees"
+
+    if native_text:
+        native_label = native_text.replace("_", " ").replace("-", " ")
+        if native_label == "naturally occurring":
+            return "naturally occurring trees"
+        return f"{native_label} trees"
+
+    diameter_parts = []
+    if instructions.get("min_diameter") is not None:
+        diameter_parts.append(f"at least {instructions['min_diameter']} DBH")
+    if instructions.get("max_diameter") is not None:
+        diameter_parts.append(f"at most {instructions['max_diameter']} DBH")
+
+    if diameter_parts:
+        return "trees with " + " and ".join(diameter_parts)
+
+    meaningful_filters = [item for item in filters if item != "No filters applied"]
+
+    if not meaningful_filters:
+        return "tree records in the full dataset"
+
+    return "trees matching " + "; ".join(meaningful_filters)
+
+
 def build_result(
     df: pd.DataFrame,
     filtered_df: pd.DataFrame,
@@ -1233,7 +1275,14 @@ def build_result(
         native_col = roles["native_status"]
         table_df = filtered_df[native_col].astype(str).value_counts().reset_index()
         table_df.columns = ["Native status", "Count"]
-        verified_summary = f"There are {matching_rows:,} matching tree records, which is {percent}% of the full dataset. The filters used were: {'; '.join(filters)}."
+        status_parts = [
+            f"{row['Native status']} ({int(row['Count']):,})"
+            for _, row in table_df.head(5).iterrows()
+        ]
+        verified_summary = (
+            f"The native-status field is {native_col}. For {describe_query_subject(instructions, filters)}, "
+            f"the breakdown is {', '.join(status_parts)} across {matching_rows:,} records."
+        )
 
     elif intent == "diameter_summary":
         table_df, diameter_summary = make_diameter_table(filtered_df, schema)
@@ -1248,7 +1297,11 @@ def build_result(
         danger_col = roles["danger_flag"]
         table_df = filtered_df[danger_col].astype(str).value_counts().reset_index()
         table_df.columns = ["Danger flag", "Count"]
-        verified_summary = f"The danger/hazard summary used the {danger_col} field. There are {matching_rows:,} matching records out of {total_rows:,} total records."
+        preview_df = filtered_df.head(int(instructions.get("limit", 1000))) if matching_rows > 0 else None
+        verified_summary = (
+            f"There are {matching_rows:,} trees marked hazardous/danger in the {danger_col} field, "
+            f"which is {percent}% of the full dataset. The matching records are available below."
+        )
 
     elif intent == "summary":
         summary_rows = [
@@ -1311,7 +1364,21 @@ def build_result(
 
         preview_df = filtered_df.head(int(instructions.get("limit", 1000))) if matching_rows > 0 else None
 
-        verified_summary = f"There are {matching_rows:,} matching tree records, which is {percent}% of the full dataset. The filters used were: {'; '.join(filters)}."
+        if intent == "count":
+            verified_summary = (
+                f"There are {matching_rows:,} {describe_query_subject(instructions, filters)}, "
+                f"which is {percent}% of the full dataset."
+            )
+        elif intent == "filter":
+            verified_summary = (
+                f"I found {matching_rows:,} {describe_query_subject(instructions, filters)}, "
+                f"which is {percent}% of the full dataset. A preview of the matching rows is available below."
+            )
+        else:
+            verified_summary = (
+                f"I found {matching_rows:,} {describe_query_subject(instructions, filters)}, "
+                f"which is {percent}% of the full dataset."
+            )
 
     if warnings:
         verified_summary += " " + " ".join(warnings)
@@ -1333,6 +1400,7 @@ def build_result(
         "matching_record_count": int(matching_rows),
         "total_dataset_rows": int(total_rows),
         "percent_of_dataset": percent,
+        "answer_subject": describe_query_subject(instructions, filters),
         "display_count_label": display_count_label,
         "display_count_value": display_count_value,
         "filters_used": filters,
@@ -1439,6 +1507,7 @@ def explain_result(
         "matching_record_count": payload["matching_record_count"],
         "total_dataset_rows": payload["total_dataset_rows"],
         "percent_of_dataset": payload["percent_of_dataset"],
+        "answer_subject": payload.get("answer_subject"),
         "display_count_label": payload.get("display_count_label"),
         "display_count_value": payload.get("display_count_value"),
         "filters_used": payload["filters_used"],
@@ -1479,6 +1548,7 @@ Do not repeat the user's question.
     else:
         instruction = """
 Write a friendly, direct answer.
+Answer the user's question first, then briefly explain what the matched records mean.
 Mention the key count and percent if available.
 Do not repeat the user's question.
 """
@@ -1487,6 +1557,8 @@ Do not repeat the user's question.
 Use only the verified facts below. Write 2 to 4 plain-English sentences.
 Do not invent facts. Do not recalculate numbers. Do not mention JSON or internal fields.
 If a map note is present, explain it in simple terms.
+If matching records are present, describe them as the answer to the question rather than merely saying records matched.
+If answer_subject is present, use that human phrase instead of internal filter wording.
 {instruction}
 
 Verified facts:
@@ -1777,7 +1849,7 @@ def render_suggested_question_buttons(suggestions: List[str], key_prefix: str) -
 
     for index, suggestion in enumerate(suggestions):
         with columns[index % 2]:
-            if st.button(suggestion, key=f"{key_prefix}::{index}", use_container_width=True):
+            if st.button(suggestion, key=f"{key_prefix}::{index}", width="stretch"):
                 selected_question = suggestion
 
     return selected_question
@@ -1811,10 +1883,24 @@ def render_assistant_results(
         st.write(explanation)
 
         if payload.get("intent") == "species_list" and table_df is not None:
+            st.caption(f"Showing all {len(table_df):,} species/common names. Scroll the table or filter it below.")
+            species_filter = st.text_input(
+                "Filter species list",
+                key=f"species-filter::{csv_name}::{active_chat_id}::{message_index}::{result_index}",
+                placeholder="Type part of a species name...",
+            )
+            visible_species_df = table_df
+
+            if species_filter:
+                visible_species_df = table_df[
+                    table_df["Species"].astype(str).str.contains(species_filter, case=False, na=False)
+                ]
+                st.caption(f"{len(visible_species_df):,} species match this filter.")
+
             st.dataframe(
-                table_df,
-                use_container_width=True,
-                height=420,
+                visible_species_df,
+                width="stretch",
+                height=650,
                 hide_index=True,
             )
             st.download_button(
@@ -1892,7 +1978,7 @@ def render_assistant_results(
                             species_summary.columns = ["Species", "Count"]
 
                             with st.expander("Species inside drawn area", expanded=False):
-                                st.dataframe(species_summary, use_container_width=True)
+                                st.dataframe(species_summary, width="stretch")
 
                         display_cols = [
                             col for col in [
@@ -1908,9 +1994,9 @@ def render_assistant_results(
 
                         with st.expander("Rows inside drawn area", expanded=False):
                             if display_cols:
-                                st.dataframe(selected_df[display_cols].head(1000), use_container_width=True)
+                                st.dataframe(selected_df[display_cols].head(1000), width="stretch")
                             else:
-                                st.dataframe(selected_df.head(1000), use_container_width=True)
+                                st.dataframe(selected_df.head(1000), width="stretch")
 
         with st.expander("Data result", expanded=False):
             if payload.get("result_available"):
@@ -1928,11 +2014,11 @@ def render_assistant_results(
                 st.caption("Reused cached query result.")
 
             if table_df is not None and payload.get("intent") != "species_list":
-                st.dataframe(table_df, use_container_width=True)
+                st.dataframe(table_df, width="stretch")
 
             if preview_df is not None:
                 with st.expander("Preview matching rows", expanded=False):
-                    st.dataframe(preview_df, use_container_width=True)
+                    st.dataframe(preview_df, width="stretch")
 
         with st.expander("Developer details", expanded=False):
             st.write("Question interpretation")
@@ -2037,11 +2123,11 @@ selected_map_style = "Standard"
 
 chats_key, chats, active_chat_id = init_chat_state(csv_choice.name)
 
-if st.sidebar.button("New chat", use_container_width=True):
+if st.sidebar.button("New chat", width="stretch"):
     create_new_chat(csv_choice.name)
     st.rerun()
 
-if st.sidebar.button("Clear current chat", use_container_width=True):
+if st.sidebar.button("Clear current chat", width="stretch"):
     st.session_state[chats_key][active_chat_id]["messages"] = []
     st.session_state[chats_key][active_chat_id]["title"] = "New chat"
     st.rerun()
@@ -2064,6 +2150,7 @@ active_chat_id = st.session_state[f"active_chat::{csv_choice.name}"]
 messages = st.session_state[chats_key][active_chat_id]["messages"]
 
 last_filter_key = f"last_filter::{csv_choice.name}::{active_chat_id}"
+suggested_prompt_key = f"suggested_prompt::{csv_choice.name}::{active_chat_id}"
 
 if "schema_refine_executor" not in st.session_state:
     st.session_state["schema_refine_executor"] = ThreadPoolExecutor(max_workers=1)
@@ -2184,7 +2271,7 @@ with st.sidebar.expander("Advanced options", expanded=False):
     else:
         st.markdown("🔴 **Using automatic setup**")
 
-    if st.button("Refine dataset setup with AI", disabled=refine_running, use_container_width=True):
+    if st.button("Refine dataset setup with AI", disabled=refine_running, width="stretch"):
         st.session_state[refine_model_key] = st.session_state["schema_model"]
 
         st.session_state[refine_future_key] = st.session_state["schema_refine_executor"].submit(
@@ -2200,7 +2287,7 @@ with st.sidebar.expander("Advanced options", expanded=False):
 
         st.rerun()
 
-    if st.button("Reset dataset setup", disabled=refine_running, use_container_width=True):
+    if st.button("Reset dataset setup", disabled=refine_running, width="stretch"):
         st.session_state[schema_key] = base_schema
 
         if refine_error_key in st.session_state:
@@ -2220,7 +2307,7 @@ with st.sidebar.expander("Advanced options", expanded=False):
             st.write("Rule-based schema guess")
             st.json(schema.get("rule_schema_guess"))
 
-    if st.button("Clear query cache", use_container_width=True):
+    if st.button("Clear query cache", width="stretch"):
         st.session_state["query_cache"] = {}
         st.success("Query cache cleared.")
 
@@ -2247,7 +2334,7 @@ if coordinate_note:
     st.info(coordinate_note)
 
 with st.expander("Preview data"):
-    st.dataframe(df.head(25), use_container_width=True)
+    st.dataframe(df.head(25), width="stretch")
 
 
 def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
@@ -2391,11 +2478,7 @@ if not refine_running and pending_schema_question_key in st.session_state:
         "results": results,
     })
 
-suggested_prompt = render_suggested_question_buttons(
-    make_suggested_questions(df, schema, coord_rows),
-    f"suggested::{csv_choice.name}::{active_chat_id}",
-)
-
+suggested_prompt = st.session_state.pop(suggested_prompt_key, None)
 prompt = st.chat_input("Ask about your forestry or spatial data...")
 
 active_prompt = suggested_prompt or prompt
@@ -2448,3 +2531,12 @@ if active_prompt:
             "role": "assistant",
             "results": results,
         })
+
+next_suggested_prompt = render_suggested_question_buttons(
+    make_suggested_questions(df, schema, coord_rows),
+    f"suggested::{csv_choice.name}::{active_chat_id}",
+)
+
+if next_suggested_prompt:
+    st.session_state[suggested_prompt_key] = next_suggested_prompt
+    st.rerun()
