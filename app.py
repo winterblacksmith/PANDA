@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import re
+import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
@@ -19,6 +20,9 @@ except Exception:
 
 
 DATA_DIR = Path("data")
+RASTER_DIR = Path("rasters")
+STORAGE_DIR = Path("storage")
+SQLITE_DB_PATH = STORAGE_DIR / "canopy.sqlite"
 APP_STATE_VERSION = "stable_chat_tree_ai_2026_06_04_v1"
 APP_NAME = "Canopy"
 APP_DESCRIPTION = (
@@ -49,6 +53,8 @@ MAP_TILE_OPTIONS = {
         "attr": "Tiles: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
     },
 }
+
+RASTER_EXTENSIONS = {".tif", ".tiff", ".img", ".vrt", ".jp2"}
 
 
 # -----------------------------
@@ -84,6 +90,200 @@ def get_installed_ollama_models() -> List[str]:
 @st.cache_data
 def load_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
+
+
+def ensure_storage_dirs() -> None:
+    STORAGE_DIR.mkdir(exist_ok=True)
+    RASTER_DIR.mkdir(exist_ok=True)
+
+
+def safe_sql_identifier(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_").lower()
+    return cleaned or "dataset"
+
+
+def quote_sql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def get_sql_table_name(csv_name: str) -> str:
+    stem = Path(csv_name).stem
+    return "dataset_" + safe_sql_identifier(stem)
+
+
+def get_sql_connection() -> sqlite3.Connection:
+    ensure_storage_dirs()
+    return sqlite3.connect(SQLITE_DB_PATH)
+
+
+def sync_dataframe_to_sqlite(csv_name: str, df: pd.DataFrame) -> str:
+    table_name = get_sql_table_name(csv_name)
+
+    with get_sql_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dataset_registry (
+                csv_name TEXT PRIMARY KEY,
+                table_name TEXT NOT NULL,
+                row_count INTEGER NOT NULL,
+                column_count INTEGER NOT NULL,
+                synced_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        existing = conn.execute(
+            "SELECT row_count, column_count FROM dataset_registry WHERE csv_name = ?",
+            (csv_name,),
+        ).fetchone()
+
+        if existing != (len(df), len(df.columns)):
+            df.to_sql(table_name, conn, if_exists="replace", index=True, index_label="__rowid")
+            conn.execute(
+                """
+                INSERT INTO dataset_registry (csv_name, table_name, row_count, column_count, synced_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(csv_name) DO UPDATE SET
+                    table_name = excluded.table_name,
+                    row_count = excluded.row_count,
+                    column_count = excluded.column_count,
+                    synced_at = CURRENT_TIMESTAMP
+                """,
+                (csv_name, table_name, len(df), len(df.columns)),
+            )
+
+    return table_name
+
+
+def build_sql_where_clause(schema: Dict[str, Any], instructions: Dict[str, Any]) -> Tuple[List[str], List[Any], List[str], List[str]]:
+    roles = schema["roles"]
+    where_parts: List[str] = []
+    params: List[Any] = []
+    filters: List[str] = []
+    warnings: List[str] = []
+
+    species_cols = [roles.get("species_common"), roles.get("scientific_name")]
+    species_cols = [col for col in species_cols if col]
+
+    if instructions.get("species_text"):
+        if species_cols:
+            species_parts = []
+
+            for col in species_cols:
+                species_parts.append(f"LOWER(CAST({quote_sql_identifier(col)} AS TEXT)) LIKE ?")
+                params.append("%" + str(instructions["species_text"]).lower() + "%")
+
+            where_parts.append("(" + " OR ".join(species_parts) + ")")
+            filters.append("species fields contain '" + str(instructions["species_text"]) + "'")
+        else:
+            warnings.append("I could not find a species/common-name column in this CSV.")
+
+    if instructions.get("native_text"):
+        native_col = roles.get("native_status")
+
+        if native_col:
+            where_parts.append(f"LOWER(CAST({quote_sql_identifier(native_col)} AS TEXT)) LIKE ?")
+            params.append("%" + str(instructions["native_text"]).lower() + "%")
+            filters.append(native_col + " contains '" + str(instructions["native_text"]) + "'")
+        else:
+            warnings.append("This CSV does not appear to contain a native-status column, so native-tree questions cannot be answered from this file.")
+
+    diameter_col = roles.get("diameter_numeric")
+
+    if diameter_col and (instructions.get("min_diameter") is not None or instructions.get("max_diameter") is not None):
+        if instructions.get("min_diameter") is not None:
+            where_parts.append(f"CAST({quote_sql_identifier(diameter_col)} AS REAL) >= ?")
+            params.append(float(instructions["min_diameter"]))
+            filters.append(diameter_col + " >= " + str(instructions["min_diameter"]))
+
+        if instructions.get("max_diameter") is not None:
+            where_parts.append(f"CAST({quote_sql_identifier(diameter_col)} AS REAL) <= ?")
+            params.append(float(instructions["max_diameter"]))
+            filters.append(diameter_col + " <= " + str(instructions["max_diameter"]))
+    elif not diameter_col and (instructions.get("min_diameter") is not None or instructions.get("max_diameter") is not None):
+        warnings.append("I could not find a numeric diameter/DBH column in this CSV.")
+
+    danger_col = roles.get("danger_flag")
+
+    if instructions.get("danger_value") is not None:
+        if danger_col:
+            where_parts.append(f"CAST({quote_sql_identifier(danger_col)} AS REAL) = ?")
+            params.append(float(instructions["danger_value"]))
+            filters.append(danger_col + " = " + str(instructions["danger_value"]))
+        else:
+            warnings.append("I could not find a danger/hazard flag column in this CSV.")
+
+    if not filters:
+        filters.append("No filters applied")
+
+    return where_parts, params, filters, warnings
+
+
+def run_filtered_query_sql(
+    csv_name: str,
+    df: pd.DataFrame,
+    schema: Dict[str, Any],
+    instructions: Dict[str, Any],
+) -> Tuple[pd.DataFrame, List[str], List[str], str]:
+    table_name = sync_dataframe_to_sqlite(csv_name, df)
+    where_parts, params, filters, warnings = build_sql_where_clause(schema, instructions)
+    sql = f"SELECT * FROM {quote_sql_identifier(table_name)}"
+
+    if where_parts:
+        sql += " WHERE " + " AND ".join(where_parts)
+
+    with get_sql_connection() as conn:
+        result = pd.read_sql_query(sql, conn, params=params)
+
+    if "__rowid" in result.columns:
+        result = result.set_index("__rowid", drop=True)
+        result.index.name = None
+
+    return result, filters, warnings, sql
+
+
+def discover_raster_layers() -> List[Dict[str, Any]]:
+    if not RASTER_DIR.exists():
+        return []
+
+    layers: List[Dict[str, Any]] = []
+
+    for path in sorted(RASTER_DIR.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in RASTER_EXTENSIONS:
+            continue
+
+        layer = {
+            "name": path.name,
+            "path": str(path),
+            "size_mb": round(path.stat().st_size / (1024 * 1024), 2),
+            "driver": "Unknown",
+            "crs": "Unknown",
+            "width": None,
+            "height": None,
+            "bands": None,
+            "bounds": None,
+            "rasterio_available": False,
+        }
+
+        try:
+            import rasterio
+
+            with rasterio.open(path) as src:
+                layer.update({
+                    "driver": src.driver,
+                    "crs": str(src.crs) if src.crs else "Unknown",
+                    "width": src.width,
+                    "height": src.height,
+                    "bands": src.count,
+                    "bounds": tuple(round(value, 6) for value in src.bounds),
+                    "rasterio_available": True,
+                })
+        except Exception as exc:
+            layer["metadata_error"] = str(exc)
+
+        layers.append(layer)
+
+    return layers
 
 
 def get_ollama_content(response: Any) -> str:
@@ -1351,7 +1551,6 @@ def build_result(
             summary_parts.append("No usable coordinate fields were detected for mapping in this dataset.")
 
         table_df = pd.DataFrame(summary_rows)
-        preview_df = filtered_df.head(int(instructions.get("limit", 1000))) if matching_rows > 0 else None
         verified_summary = " ".join(summary_parts)
 
     else:
@@ -1843,14 +2042,30 @@ def render_suggested_question_buttons(suggestions: List[str], key_prefix: str) -
     if not suggestions:
         return None
 
+    visible_suggestions = suggestions[:4]
+    more_suggestions = suggestions[4:8]
+    show_more_key = f"{key_prefix}::show_more"
+
+    if show_more_key not in st.session_state:
+        st.session_state[show_more_key] = False
+
+    if st.session_state[show_more_key]:
+        visible_suggestions = visible_suggestions + more_suggestions
+
     st.caption("Suggested questions")
     selected_question = None
     columns = st.columns(2)
 
-    for index, suggestion in enumerate(suggestions):
+    for index, suggestion in enumerate(visible_suggestions):
         with columns[index % 2]:
             if st.button(suggestion, key=f"{key_prefix}::{index}", width="stretch"):
                 selected_question = suggestion
+
+    if more_suggestions:
+        toggle_label = "Show fewer questions ^" if st.session_state[show_more_key] else "More suggested questions v"
+        if st.button(toggle_label, key=f"{key_prefix}::toggle_more", width="stretch"):
+            st.session_state[show_more_key] = not st.session_state[show_more_key]
+            st.rerun()
 
     return selected_question
 
@@ -1880,7 +2095,31 @@ def render_assistant_results(
         result_roles = result["roles"]
         coordinate_kind = result.get("coordinate_kind", "none")
 
-        st.write(explanation)
+        extras_key = f"show-extras::{csv_name}::{active_chat_id}::{message_index}::{result_index}"
+        if extras_key not in st.session_state:
+            st.session_state[extras_key] = False
+
+        answer_col, menu_col = st.columns([0.94, 0.06], vertical_alignment="center")
+
+        with answer_col:
+            st.write(explanation)
+
+        with menu_col:
+            menu_key = f"extras-menu::{csv_name}::{active_chat_id}::{message_index}::{result_index}"
+            checkbox_key = f"extras-checkbox::{csv_name}::{active_chat_id}::{message_index}::{result_index}"
+
+            if hasattr(st, "popover"):
+                with st.popover("...", help="Response options", width="stretch", key=menu_key):
+                    st.session_state[extras_key] = st.checkbox(
+                        "Show data result and developer details",
+                        value=st.session_state[extras_key],
+                        key=checkbox_key,
+                    )
+            elif st.button("...", key=menu_key, help="Show or hide data and developer details"):
+                st.session_state[extras_key] = not st.session_state[extras_key]
+                st.rerun()
+
+        show_extras = st.session_state[extras_key]
 
         if payload.get("intent") == "species_list" and table_df is not None:
             st.caption(f"Showing all {len(table_df):,} species/common names. Scroll the table or filter it below.")
@@ -1998,34 +2237,36 @@ def render_assistant_results(
                             else:
                                 st.dataframe(selected_df.head(1000), width="stretch")
 
-        with st.expander("Data result", expanded=False):
-            if payload.get("result_available"):
-                label = payload.get("display_count_label", "Matching records")
-                value = payload.get("display_count_value", len(filtered_df))
+        if show_extras:
+            with st.expander("Data result", expanded=False):
+                if payload.get("result_available"):
+                    label = payload.get("display_count_label", "Matching records")
+                    value = payload.get("display_count_value", len(filtered_df))
 
-                st.write(f"{label}: {value:,}")
+                    st.write(f"{label}: {value:,}")
 
-                if payload.get("intent") == "species_list":
-                    st.caption(f"Tree records checked: {len(filtered_df):,}")
-            else:
-                st.write("Matching records: not applicable")
+                    if payload.get("intent") == "species_list":
+                        st.caption(f"Tree records checked: {len(filtered_df):,}")
+                else:
+                    st.write("Matching records: not applicable")
 
-            if payload.get("cache_hit"):
-                st.caption("Reused cached query result.")
+                if payload.get("cache_hit"):
+                    st.caption("Reused cached query result.")
 
-            if table_df is not None and payload.get("intent") != "species_list":
-                st.dataframe(table_df, width="stretch")
+                if table_df is not None and payload.get("intent") != "species_list":
+                    st.dataframe(table_df, width="stretch")
 
-            if preview_df is not None:
-                with st.expander("Preview matching rows", expanded=False):
-                    st.dataframe(preview_df, width="stretch")
+                if preview_df is not None:
+                    with st.expander("Preview matching rows", expanded=False):
+                        st.dataframe(preview_df, width="stretch")
 
-        with st.expander("Developer details", expanded=False):
-            st.write("Question interpretation")
-            st.json(instructions)
-            st.write("Detected dataset roles")
-            st.json(result_roles)
-            st.write(f"Cache hit: {payload.get('cache_hit', False)}")
+            with st.expander("Developer details", expanded=False):
+                st.write("Question interpretation")
+                st.json(instructions)
+                st.write("Detected dataset roles")
+                st.json(result_roles)
+                st.write(f"Cache hit: {payload.get('cache_hit', False)}")
+                st.write(f"Data backend: {result.get('data_backend', 'pandas')}")
 
 
 # -----------------------------
@@ -2085,10 +2326,14 @@ if "use_model_parse" not in st.session_state:
 if "use_model_explanation" not in st.session_state:
     st.session_state["use_model_explanation"] = True
 
+if "use_sql_backend" not in st.session_state:
+    st.session_state["use_sql_backend"] = True
+
 model_name = st.session_state["question_model"]
 schema_model_name = st.session_state["schema_model"]
 use_model_parse = st.session_state["use_model_parse"]
 use_model_explanation = st.session_state["use_model_explanation"]
+use_sql_backend = st.session_state["use_sql_backend"]
 
 base_schema = infer_schema_rules_only(csv_choice.name, df)
 schema_key = f"schema::{csv_choice.name}"
@@ -2220,6 +2465,12 @@ with st.sidebar.expander("Advanced options", expanded=False):
             value=st.session_state["use_model_explanation"],
         )
 
+        sql_backend_choice = st.checkbox(
+            "Use SQL backend for filtering",
+            value=st.session_state["use_sql_backend"],
+            help="Syncs the selected CSV into a local SQLite database and uses SQL for deterministic filtering. Turn off to use the pandas fallback.",
+        )
+
         st.markdown("### Dataset setup")
 
         schema_model_choice = st.selectbox(
@@ -2235,10 +2486,12 @@ with st.sidebar.expander("Advanced options", expanded=False):
         st.session_state["schema_model"] = schema_model_choice
         st.session_state["use_model_parse"] = parse_choice
         st.session_state["use_model_explanation"] = explanation_choice
+        st.session_state["use_sql_backend"] = sql_backend_choice
         st.rerun()
 
     st.caption(f"Question model: `{st.session_state['question_model']}`")
     st.caption(f"Schema model: `{st.session_state['schema_model']}`")
+    st.caption(f"Data backend: `{'SQLite' if st.session_state['use_sql_backend'] else 'pandas'}`")
 
     st.markdown("### Mapping")
 
@@ -2336,6 +2589,32 @@ if coordinate_note:
 with st.expander("Preview data"):
     st.dataframe(df.head(25), width="stretch")
 
+raster_layers = discover_raster_layers()
+with st.expander("Raster layers", expanded=False):
+    st.write(f"Raster folder: `{RASTER_DIR}`")
+
+    if raster_layers:
+        raster_table = pd.DataFrame([
+            {
+                "Name": layer["name"],
+                "Size MB": layer["size_mb"],
+                "Driver": layer["driver"],
+                "CRS": layer["crs"],
+                "Width": layer["width"],
+                "Height": layer["height"],
+                "Bands": layer["bands"],
+            }
+            for layer in raster_layers
+        ])
+        st.dataframe(raster_table, width="stretch", hide_index=True)
+
+        if not any(layer.get("rasterio_available") for layer in raster_layers):
+            st.caption("Raster files were found, but Rasterio is not installed, so Canopy can only show basic file information right now.")
+    else:
+        st.caption("No raster files found yet. Add GeoTIFF, IMG, VRT, or JP2 files to the rasters folder to start indexing raster layers.")
+
+    st.caption("Next raster step: install Rasterio/GDAL, then sample raster values at tree points and summarize raster values inside drawn polygons.")
+
 
 def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
     questions = split_questions(query_text)
@@ -2371,12 +2650,34 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
             question,
         )
 
-        filtered_df, filters, warnings, cache_hit, query_cache_key = get_or_run_filtered_query(
-            csv_choice.name,
-            df,
-            schema,
-            instructions,
-        )
+        if use_sql_backend:
+            try:
+                filtered_df, filters, warnings, sql_text = run_filtered_query_sql(
+                    csv_choice.name,
+                    df,
+                    schema,
+                    instructions,
+                )
+                cache_hit = False
+                query_cache_key = f"sql::{sql_text}"
+                data_backend = "SQLite"
+            except Exception as exc:
+                filtered_df, filters, warnings, cache_hit, query_cache_key = get_or_run_filtered_query(
+                    csv_choice.name,
+                    df,
+                    schema,
+                    instructions,
+                )
+                warnings.append(f"SQLite query failed, so Canopy used the pandas fallback for this answer: {exc}")
+                data_backend = "pandas fallback"
+        else:
+            filtered_df, filters, warnings, cache_hit, query_cache_key = get_or_run_filtered_query(
+                csv_choice.name,
+                df,
+                schema,
+                instructions,
+            )
+            data_backend = "pandas"
 
         if instructions.get("make_map"):
             result_map_status = get_map_status(
@@ -2434,6 +2735,7 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
             "roles": dict(roles),
             "coordinate_kind": schema.get("coordinate_kind", "none"),
             "query_cache_key": query_cache_key,
+            "data_backend": data_backend,
         })
 
     return computed_results
