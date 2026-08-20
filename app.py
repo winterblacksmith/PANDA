@@ -5,6 +5,7 @@ import json
 import pickle
 import re
 import sqlite3
+import struct
 import zlib
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +19,7 @@ import streamlit as st
 from PIL import Image
 from folium.plugins import Draw
 from streamlit_folium import st_folium
+from fvs_integration import discover_fvs_csvs
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -73,7 +75,7 @@ SUPPORTED_UPLOAD_EXTENSIONS = CSV_EXTENSIONS | RASTER_EXTENSIONS
 def get_tree_csv_files() -> List[Path]:
     return sorted([
         file for file in DATA_DIR.glob("*.csv")
-        if "Column_Headers" not in file.name
+        if not file.name.startswith("._") and "Column_Headers" not in file.name
     ])
 
 
@@ -86,7 +88,11 @@ def get_raster_files() -> List[Path]:
             continue
 
         for file in sorted(raster_dir.rglob("*")):
-            if not file.is_file() or file.suffix.lower() not in RASTER_EXTENSIONS:
+            if (
+                not file.is_file()
+                or file.name.startswith("._")
+                or file.suffix.lower() not in RASTER_EXTENSIONS
+            ):
                 continue
 
             resolved_path = file.resolve()
@@ -96,18 +102,61 @@ def get_raster_files() -> List[Path]:
             seen_paths.add(resolved_path)
             files.append(file)
 
-    return files
+    preferred_files: Dict[Tuple[str, int, int], Path] = {}
+    for file in files:
+        signature = (
+            file.name.lower(),
+            file.stat().st_size,
+            file.stat().st_mtime_ns,
+        )
+        current = preferred_files.get(signature)
+        direct_companion_count = sum(
+            (file.parent / companion_name).exists()
+            for companion_name in [
+                file.name + ".vat.dbf",
+                file.name + ".xml",
+                file.name + ".aux.xml",
+                file.with_suffix(".tfw").name,
+            ]
+        )
+        current_companion_count = -1
+        if current is not None:
+            current_companion_count = sum(
+                (current.parent / companion_name).exists()
+                for companion_name in [
+                    current.name + ".vat.dbf",
+                    current.name + ".xml",
+                    current.name + ".aux.xml",
+                    current.with_suffix(".tfw").name,
+                ]
+            )
+        if current is None or direct_companion_count > current_companion_count:
+            preferred_files[signature] = file
+
+    return sorted(preferred_files.values())
 
 
 def get_dataset_options() -> List[Tuple[str, Path]]:
+    fvs_options = [("fvs", path) for path in discover_fvs_csvs(DATA_DIR)]
     csv_options = [("csv", path) for path in get_tree_csv_files()]
     raster_options = [("raster", path) for path in get_raster_files()]
-    return csv_options + raster_options
+    return fvs_options + csv_options + raster_options
 
 
 def format_dataset_option(option: Tuple[str, Path]) -> str:
     dataset_kind, path = option
-    label = "Raster" if dataset_kind == "raster" else "CSV"
+    if dataset_kind == "fvs":
+        label = "FVS stands + shapefile"
+    elif dataset_kind == "raster":
+        label = "Raster"
+    else:
+        label = "CSV"
+    if dataset_kind == "raster" and path.parent != RASTER_DIR:
+        try:
+            folder = path.parent.relative_to(RASTER_DIR)
+            return f"{path.name} ({label} - {folder})"
+        except ValueError:
+            pass
     return f"{path.name} ({label})"
 
 
@@ -309,7 +358,12 @@ def sync_dataframe_to_sqlite(csv_name: str, df: pd.DataFrame) -> str:
             (csv_name,),
         ).fetchone()
 
-        if existing != (len(df), len(df.columns)):
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone() is not None
+
+        if not table_exists or existing != (len(df), len(df.columns)):
             df.to_sql(table_name, conn, if_exists="replace", index=True, index_label="__rowid")
             conn.execute(
                 """
@@ -463,6 +517,211 @@ def run_filtered_query_sql(
     return result, filters, warnings, sql, params
 
 
+def find_raster_companion(path: Path, companion_name: str) -> Optional[Path]:
+    direct_candidate = path.parent / companion_name
+    if direct_candidate.exists():
+        return direct_candidate
+
+    matches = []
+    for raster_dir in RASTER_SEARCH_DIRS:
+        if raster_dir.exists():
+            matches.extend(raster_dir.rglob(companion_name))
+
+    if not matches:
+        return None
+
+    matching_package = [
+        match
+        for match in matches
+        if match.parent.name.lower() == path.stem.lower()
+    ]
+    return sorted(matching_package or matches)[0]
+
+
+def get_raster_companion_paths(path: Path) -> Dict[str, Path]:
+    return {
+        key: companion
+        for key, companion in {
+            "attribute_table": find_raster_companion(path, path.name + ".vat.dbf"),
+            "metadata": find_raster_companion(path, path.name + ".xml"),
+            "auxiliary_metadata": find_raster_companion(path, path.name + ".aux.xml"),
+            "world_file": find_raster_companion(path, path.with_suffix(".tfw").name),
+        }.items()
+        if companion is not None
+    }
+
+
+def get_raster_companion_signature(path: Path) -> Tuple[Tuple[str, float], ...]:
+    return tuple(
+        sorted(
+            (key, companion.stat().st_mtime)
+            for key, companion in get_raster_companion_paths(path).items()
+        )
+    )
+
+
+@st.cache_data(show_spinner=False)
+def read_dbf_table(path_text: str, modified_time: float) -> pd.DataFrame:
+    del modified_time
+    with open(path_text, "rb") as dbf_file:
+        header = dbf_file.read(32)
+        if len(header) < 32:
+            raise ValueError("The DBF header is incomplete.")
+
+        record_count = struct.unpack("<I", header[4:8])[0]
+        header_length = struct.unpack("<H", header[8:10])[0]
+        record_length = struct.unpack("<H", header[10:12])[0]
+        fields = []
+
+        while True:
+            descriptor = dbf_file.read(32)
+            if not descriptor or descriptor[0] == 0x0D:
+                break
+            fields.append({
+                "name": descriptor[:11].split(b"\x00", 1)[0].decode("latin-1"),
+                "type": chr(descriptor[11]),
+                "length": descriptor[16],
+                "decimals": descriptor[17],
+            })
+
+        dbf_file.seek(header_length)
+        records = []
+        for _ in range(record_count):
+            record = dbf_file.read(record_length)
+            if len(record) < record_length:
+                break
+            if record[0] == 0x2A:
+                continue
+
+            offset = 1
+            parsed = {}
+            for field in fields:
+                raw_value = record[offset:offset + field["length"]].decode(
+                    "latin-1",
+                    errors="replace",
+                ).strip()
+                offset += field["length"]
+                parsed[field["name"]] = raw_value or None
+            records.append(parsed)
+
+    table = pd.DataFrame(records)
+    for field in fields:
+        column = field["name"]
+        if column not in table.columns or field["type"] not in {"N", "F"}:
+            continue
+        if column == "PLT_CN":
+            table[column] = table[column].astype("string").str.replace(r"\.0+$", "", regex=True)
+            continue
+        table[column] = pd.to_numeric(table[column], errors="coerce")
+        if field["decimals"] == 0:
+            table[column] = table[column].astype("Int64")
+
+    return table
+
+
+@st.cache_data(show_spinner=False)
+def read_raster_product_metadata(path_text: str, modified_time: float) -> Dict[str, Any]:
+    import xml.etree.ElementTree as ET
+
+    del modified_time
+    root = ET.parse(path_text).getroot()
+    title = root.findtext(".//resTitle")
+    abstract = root.findtext(".//idAbs")
+    entity_overview = root.findtext(".//eaover") or ""
+    value_match = re.search(
+        r"(?:^|\n)Value\s*=\s*(.+?)(?=\n[A-Za-z][A-Za-z0-9_]*\s*=|\Z)",
+        entity_overview,
+        flags=re.DOTALL,
+    )
+
+    value_definition = value_match.group(1).strip() if value_match else None
+    band_role = "TM_ID" if "Equivalent to “TM_ID”" in entity_overview or "Equivalent to \"TM_ID\"" in entity_overview else None
+    resolution = "30 x 30 meters" if re.search(r"30[×x]30\s*(?:meter|m)", entity_overview + "\n" + (abstract or ""), re.I) else None
+
+    return {
+        "title": title,
+        "abstract": abstract,
+        "value_definition": value_definition,
+        "band_role": band_role,
+        "resolution_description": resolution,
+    }
+
+
+def attach_raster_companion_data(path: Path, summary: Dict[str, Any]) -> Dict[str, Any]:
+    companions = get_raster_companion_paths(path)
+    summary["companion_files"] = {
+        key: str(companion)
+        for key, companion in companions.items()
+    }
+
+    metadata_path = companions.get("metadata")
+    if metadata_path:
+        try:
+            summary["product_metadata"] = read_raster_product_metadata(
+                str(metadata_path.resolve()),
+                metadata_path.stat().st_mtime,
+            )
+        except Exception as exc:
+            summary["metadata_warning"] = str(exc)
+
+    attribute_path = companions.get("attribute_table")
+    if not attribute_path:
+        return summary
+
+    try:
+        attribute_table = read_dbf_table(
+            str(attribute_path.resolve()),
+            attribute_path.stat().st_mtime,
+        )
+    except Exception as exc:
+        summary["attribute_table_warning"] = str(exc)
+        return summary
+
+    summary["attribute_table"] = attribute_table
+    summary["attribute_rows"] = len(attribute_table)
+    summary["attribute_fields"] = list(attribute_table.columns)
+
+    if {"Value", "Count"}.issubset(attribute_table.columns):
+        lookup_columns = [
+            column
+            for column in [
+                "Value",
+                "TM_ID",
+                "ForTypName",
+                "FldTypName",
+                "BALIVE",
+                "CANOPYPCT",
+                "STANDHT",
+                "TPA_LIVE",
+            ]
+            if column in attribute_table.columns
+        ]
+        lookup = attribute_table[lookup_columns].copy()
+        top_table = pd.DataFrame(summary.get("top_values", []))
+        if not top_table.empty:
+            top_table = top_table.merge(lookup, on="Value", how="left")
+            summary["top_values"] = top_table.to_dict("records")
+
+    if {"ForTypName", "Count"}.issubset(attribute_table.columns):
+        forest_types = (
+            attribute_table.dropna(subset=["ForTypName"])
+            .groupby("ForTypName", as_index=False)["Count"]
+            .sum()
+            .sort_values("Count", ascending=False)
+        )
+        total_pixels = float(forest_types["Count"].sum())
+        forest_types = forest_types.rename(
+            columns={"ForTypName": "Forest type", "Count": "Pixels"}
+        )
+        forest_types["Pixels"] = forest_types["Pixels"].round().astype("Int64")
+        forest_types["Percent of mapped pixels"] = (
+            forest_types["Pixels"].astype(float) / total_pixels * 100
+        ).round(2)
+        summary["forest_type_summary"] = forest_types.to_dict("records")
+
+    return summary
+
+
 def discover_raster_layers() -> List[Dict[str, Any]]:
     layers: List[Dict[str, Any]] = []
     seen_paths = set()
@@ -506,6 +765,9 @@ def discover_raster_layers() -> List[Dict[str, Any]]:
                         "height": src.height,
                         "bands": src.count,
                         "bounds": tuple(round(value, 6) for value in src.bounds),
+                        "resolution": tuple(round(value, 6) for value in src.res),
+                        "band_descriptions": list(src.descriptions),
+                        "units": list(src.units),
                         "rasterio_available": True,
                     })
 
@@ -536,10 +798,15 @@ def discover_raster_layers() -> List[Dict[str, Any]]:
 
 
 @st.cache_data(show_spinner=False)
-def read_raster_data_summary(path_text: str, modified_time: float) -> Dict[str, Any]:
+def read_raster_data_summary(
+    path_text: str,
+    modified_time: float,
+    companion_signature: Tuple[Tuple[str, float], ...] = (),
+) -> Dict[str, Any]:
     import rasterio
 
     del modified_time
+    del companion_signature
     with rasterio.open(path_text) as src:
         band = src.read(1, masked=True)
         valid_values = band.compressed()
@@ -557,7 +824,7 @@ def read_raster_data_summary(path_text: str, modified_time: float) -> Dict[str, 
             for index in top_indexes
         ]
 
-        return {
+        summary = {
             "valid_pixels": int(valid_values.size),
             "nodata_pixels": int(band.size - valid_values.size),
             "minimum": float(valid_values.min()),
@@ -570,6 +837,7 @@ def read_raster_data_summary(path_text: str, modified_time: float) -> Dict[str, 
             "unit": src.units[0] if src.units else None,
             "has_color_table": False,
         }
+        return attach_raster_companion_data(Path(path_text), summary)
 
 
 @st.cache_data(show_spinner=False)
@@ -737,6 +1005,8 @@ def get_raster_layer_for_path(path: Path) -> Dict[str, Any]:
 
 def format_raster_context(layer: Dict[str, Any]) -> str:
     data_summary = layer.get("data_summary", {})
+    product_metadata = data_summary.get("product_metadata", {})
+    dominant_forest_types = data_summary.get("forest_type_summary", [])[:10]
     return "\n".join([
         f"Name: {layer.get('name', 'Unknown')}",
         f"Folder: {layer.get('folder', 'Unknown')}",
@@ -757,6 +1027,14 @@ def format_raster_context(layer: Dict[str, Any]) -> str:
         f"Distinct values: {data_summary.get('unique_values', 'Unknown')}",
         f"Band description: {data_summary.get('band_name') or 'Not embedded in the file'}",
         f"Unit: {data_summary.get('unit') or 'Not embedded in the file'}",
+        f"Product title: {product_metadata.get('title', 'Not available')}",
+        f"Pixel value meaning: {product_metadata.get('value_definition') or 'Not documented'}",
+        f"Band role: {product_metadata.get('band_role') or 'Not documented'}",
+        f"Resolution description: {product_metadata.get('resolution_description') or layer.get('resolution', 'Unknown')}",
+        f"Raster attribute rows: {data_summary.get('attribute_rows', 0)}",
+        f"Raster attribute fields: {data_summary.get('attribute_fields', [])}",
+        f"Dominant forest types weighted by mapped pixels: {dominant_forest_types}",
+        f"Product abstract: {(product_metadata.get('abstract') or 'Not available')[:1600]}",
     ])
 
 
@@ -773,6 +1051,7 @@ def summarize_raster_layer(layer: Dict[str, Any]) -> str:
     crs = layer.get("crs", "Unknown")
     bounds = layer.get("bounds_wgs84")
     data_summary = layer.get("data_summary", {})
+    product_metadata = data_summary.get("product_metadata", {})
     location_text = f" Its geographic footprint is approximately {bounds}." if bounds else ""
     value_text = ""
     if data_summary.get("valid_pixels"):
@@ -780,6 +1059,20 @@ def summarize_raster_layer(layer: Dict[str, Any]) -> str:
             f" Band 1 contains {data_summary['valid_pixels']:,} valid pixels and "
             f"{data_summary['unique_values']:,} distinct values, ranging from "
             f"{data_summary['minimum']:,.0f} to {data_summary['maximum']:,.0f}."
+        )
+
+    if product_metadata.get("band_role") == "TM_ID" and data_summary.get("attribute_rows"):
+        dominant_types = data_summary.get("forest_type_summary", [])[:3]
+        dominant_text = ", ".join(
+            f"{row['Forest type']} ({row['Percent of mapped pixels']:.1f}%)"
+            for row in dominant_types
+        )
+        return (
+            f"`{layer.get('name')}` is a {layer.get('driver', 'raster')} TreeMap 2022 plot-identifier raster "
+            f"with {bands} band, {width:,} columns by {height:,} rows, using CRS {crs}."
+            f"{location_text}{value_text} Each valid pixel represents a 30 x 30 meter modeled forest cell "
+            f"whose value is a `TM_ID`, linking it to one of {data_summary['attribute_rows']:,} forest plot "
+            f"profiles in the accompanying attribute table. The dominant mapped forest types are {dominant_text}."
         )
 
     return (
@@ -801,6 +1094,8 @@ def interpret_raster_question(question: str, model_name: str, use_model: bool) -
         "point_sampling",
         "polygon_analysis",
         "inventory_connection",
+        "attribute_meaning",
+        "forest_types",
         "general_chat",
         "other",
     }
@@ -820,6 +1115,8 @@ Allowed labels:
 - point_sampling: asks what is needed to sample raster values at points
 - polygon_analysis: asks about drawn polygons, zonal analysis, or values inside an area
 - inventory_connection: asks how the raster connects or joins to a tree inventory or CSV
+- attribute_meaning: asks what Band 1, pixel codes, TM_ID, plot IDs, or raster values represent
+- forest_types: asks which forest types occur, are dominant, or cover the most area
 - general_chat: casual conversation not asking about data or capabilities
 - other: a raster-related question that does not fit another label
 
@@ -842,6 +1139,10 @@ User question: {question}
         return "inventory_connection"
     if "sample" in lowered or "tree point" in lowered:
         return "point_sampling"
+    if "forest type" in lowered:
+        return "forest_types"
+    if any(term in lowered for term in ["tm_id", "plot id", "pixel code", "band 1 represent", "values represent"]):
+        return "attribute_meaning"
     if "canopy" in lowered and any(term in lowered for term in ["do", "support", "right now"]):
         return "current_capabilities"
     if "crs" in lowered or "projection" in lowered:
@@ -861,20 +1162,29 @@ def answer_raster_question(question: str, layer: Dict[str, Any], model_name: str
     fallback = summarize_raster_layer(layer)
     lowered = question.lower().strip()
     data_summary = layer.get("data_summary", {})
+    product_metadata = data_summary.get("product_metadata", {})
     bounds = layer.get("bounds_wgs84")
     intent = interpret_raster_question(question, model_name, use_model)
+    has_attribute_table = bool(data_summary.get("attribute_rows"))
+    attribute_capability = (
+        "The accompanying raster attribute table is available, so Canopy can translate TM_ID pixel values into "
+        "forest type, live basal area, canopy percentage, stand height, live trees per acre, biomass, and carbon attributes."
+        if has_attribute_table
+        else "No accompanying raster attribute table is available, so numeric codes cannot be translated into named attributes."
+    )
 
     focus_contexts = {
         "current_capabilities": (
             "Canopy currently reads GeoTIFF metadata, displays the actual Band 1 cells as a color-stretched map "
-            "layer, and calculates whole-raster statistics and common numeric values. It does not yet sample CSV "
-            "tree points, calculate statistics inside drawn polygons, join raster values to inventory rows, or "
-            "translate codes into named classes without a legend."
+            "layer, calculates whole-raster statistics and common numeric values, and reads an accompanying ArcGIS "
+            f"raster attribute table when present. {attribute_capability} It does not yet sample CSV tree points, "
+            "calculate statistics inside drawn polygons, or join raster values to inventory rows."
         ),
         "point_sampling": (
             "Point sampling is not implemented yet. The implementation requires reading tree coordinates from the "
             "selected CSV, transforming them from their source CRS into this raster's EPSG:5070 CRS, sampling Band 1 "
-            "at each transformed coordinate with Rasterio, and attaching the sampled code to its tree record."
+            "at each transformed coordinate with Rasterio, and attaching the sampled TM_ID and its linked forest "
+            "attributes to the tree record."
         ),
         "polygon_analysis": (
             "The raster can be analyzed with polygons in principle, but the raster view does not perform this yet. "
@@ -884,8 +1194,10 @@ def answer_raster_question(question: str, layer: Dict[str, Any], model_name: str
         "inventory_connection": (
             "The raster and CSV inventory are currently separate selectable datasets. Connecting them requires a "
             "spatial join: read each tree coordinate, transform it to EPSG:5070, sample Band 1 at that point, and add "
-            "the sampled raster code as a new value on the corresponding tree row. Class names still require a legend."
+            "the sampled TM_ID and its linked forest-profile attributes to the corresponding tree row."
         ),
+        "attribute_meaning": format_raster_context(layer),
+        "forest_types": format_raster_context(layer),
         "general_chat": (
             "Canopy is an AI knowledge base for forestry, tree inventory, raster, and spatial datasets. Respond "
             "naturally to casual conversation and do not force dataset facts into the response."
@@ -924,9 +1236,15 @@ Never invent raster meanings, class names, units, or implemented features.
             "That point-sampling workflow is not implemented yet."
         )
     if intent == "current_capabilities":
+        if has_attribute_table:
+            return (
+                "Canopy can read and map this GeoTIFF, summarize its pixels, interpret Band 1 as TreeMap `TM_ID` values, "
+                "and use the accompanying attribute table to report forest type and structural attributes. Point "
+                "sampling and polygon statistics are not implemented yet."
+            )
         return (
             "Canopy can currently read this GeoTIFF, display its actual Band 1 cells, and summarize its metadata and "
-            "whole-raster values. Point sampling, polygon statistics, and code-to-class translation are the next steps."
+            "whole-raster values. Point sampling, polygon statistics, and code translation are the next steps."
         )
     if intent == "general_chat":
         return explain_general_chat(question, model_name, False)
@@ -941,6 +1259,18 @@ Never invent raster meanings, class names, units, or implemented features.
             f"{data_summary['unique_values']:,} distinct values, ranging from "
             f"{data_summary['minimum']:,.0f} to {data_summary['maximum']:,.0f}."
         )
+    if intent == "attribute_meaning" and product_metadata.get("band_role") == "TM_ID":
+        return (
+            "Band 1 stores a TreeMap `TM_ID`, not a measured environmental unit. Each 30 x 30 meter forest pixel "
+            "links to a modeled FIA plot profile in the accompanying attribute table."
+        )
+    if intent == "forest_types" and data_summary.get("forest_type_summary"):
+        top_types = data_summary["forest_type_summary"][:5]
+        readable = ", ".join(
+            f"{row['Forest type']} ({row['Percent of mapped pixels']:.1f}%)"
+            for row in top_types
+        )
+        return f"The dominant mapped forest types are {readable}."
     return fallback
 
 
@@ -952,6 +1282,8 @@ def make_raster_suggested_questions(layer: Dict[str, Any]) -> List[str]:
         "Where is this raster located?",
         "What are the raster dimensions?",
         "What can Canopy do with this raster right now?",
+        "What do the Band 1 pixel values represent?",
+        "What are the dominant forest types in this raster?",
         "What is needed to sample raster values at tree points?",
         "Can this raster be used with drawn polygons?",
         "How would this raster connect to the tree inventory?",
@@ -3091,6 +3423,12 @@ use_model_parse = st.session_state["use_model_parse"]
 use_model_explanation = st.session_state["use_model_explanation"]
 use_sql_backend = st.session_state["use_sql_backend"]
 
+if dataset_kind == "fvs":
+    from fvs_drive_bridge import render_fvs_drive_mode
+
+    render_fvs_drive_mode(globals(), dataset_path)
+    st.stop()
+
 if dataset_kind == "raster":
     raster_key = f"raster::{dataset_path.name}"
     chats_key, chats, active_chat_id = init_chat_state(raster_key)
@@ -3154,6 +3492,7 @@ if dataset_kind == "raster":
         raster_layer["data_summary"] = read_raster_data_summary(
             str(dataset_path.resolve()),
             dataset_path.stat().st_mtime,
+            get_raster_companion_signature(dataset_path),
         )
 
     st.subheader("Raster overview")
@@ -3183,20 +3522,68 @@ if dataset_kind == "raster":
 
     data_summary = raster_layer.get("data_summary", {})
     if data_summary.get("valid_pixels"):
+        product_metadata = data_summary.get("product_metadata", {})
+        value_label = "TM_ID" if product_metadata.get("band_role") == "TM_ID" else "value"
         st.write("Raster value summary")
         s1, s2, s3, s4 = st.columns(4)
         s1.metric("Valid pixels", f"{data_summary['valid_pixels']:,}")
         s2.metric("Distinct values", f"{data_summary['unique_values']:,}")
-        s3.metric("Minimum", f"{data_summary['minimum']:,.0f}")
-        s4.metric("Maximum", f"{data_summary['maximum']:,.0f}")
-        with st.expander("Most common raster values", expanded=False):
+        s3.metric(f"Minimum {value_label}", f"{data_summary['minimum']:,.0f}")
+        s4.metric(f"Maximum {value_label}", f"{data_summary['maximum']:,.0f}")
+        with st.expander("Most common mapped plot profiles", expanded=False):
             st.dataframe(pd.DataFrame(data_summary["top_values"]), width="stretch", hide_index=True)
-            st.caption("These are numeric codes. This GeoTIFF does not contain the legend needed to name them.")
+            if data_summary.get("attribute_rows"):
+                st.caption(
+                    "Each pixel value is a TreeMap TM_ID. The accompanying raster attribute table supplies the "
+                    "linked forest type and structural attributes shown here."
+                )
+            else:
+                st.caption("These are numeric codes; no accompanying attribute table was found to interpret them.")
+
+        if data_summary.get("forest_type_summary"):
+            with st.expander("Mapped forest types", expanded=False):
+                st.dataframe(
+                    pd.DataFrame(data_summary["forest_type_summary"]),
+                    width="stretch",
+                    height=360,
+                    hide_index=True,
+                )
+                st.caption(
+                    "Percentages are weighted by the number of 30 x 30 meter raster pixels assigned to each forest type."
+                )
+
+        if data_summary.get("attribute_rows"):
+            with st.expander("Raster attribute table", expanded=False):
+                st.caption(
+                    f"{data_summary['attribute_rows']:,} modeled plot profiles from "
+                    f"`{Path(data_summary['companion_files']['attribute_table']).name}`."
+                )
+                st.dataframe(
+                    data_summary["attribute_table"],
+                    width="stretch",
+                    height=420,
+                    hide_index=True,
+                )
+
+        if product_metadata:
+            with st.expander("Raster product documentation", expanded=False):
+                if product_metadata.get("title"):
+                    st.write(product_metadata["title"])
+                if product_metadata.get("value_definition"):
+                    st.write(f"**Pixel value:** {product_metadata['value_definition']}")
+                if product_metadata.get("abstract"):
+                    st.write(product_metadata["abstract"])
 
     raster_footprint_map = make_raster_footprint_map([raster_layer])
     if raster_footprint_map is not None:
         st.write("Raster data preview")
-        st.caption("The colored layer shows actual Band 1 pixel values using a display stretch; it is not a class legend.")
+        if data_summary.get("product_metadata", {}).get("band_role") == "TM_ID":
+            st.caption(
+                "The colored layer shows the spatial pattern of TM_ID values. Colors distinguish identifier values "
+                "for previewing the raster; they do not represent an ordered forest measurement."
+            )
+        else:
+            st.caption("The colored layer shows actual Band 1 pixel values using a display stretch; it is not a class legend.")
         st_folium(
             raster_footprint_map,
             width=1000,
