@@ -1,4 +1,10 @@
 from pathlib import Path
+import importlib
+
+# Streamlit reruns in the same interpreter. Refresh directory caches when new
+# project modules are added, including on external drives with coarse mtimes.
+importlib.invalidate_caches()
+
 import base64
 from io import BytesIO
 import json
@@ -20,6 +26,7 @@ from PIL import Image
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 from fvs_integration import discover_fvs_csvs
+from map_basemaps import carto_basemap
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -44,14 +51,8 @@ MAP_TILE_OPTIONS = {
         "tiles": "OpenStreetMap",
         "attr": None,
     },
-    "Light": {
-        "tiles": "CartoDB positron",
-        "attr": None,
-    },
-    "Dark": {
-        "tiles": "CartoDB dark_matter",
-        "attr": None,
-    },
+    "Light": carto_basemap("light_all"),
+    "Dark": carto_basemap("dark_all"),
     "Terrain": {
         "tiles": "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
         "attr": "Map data: OpenStreetMap contributors, SRTM | Map style: OpenTopoMap",
@@ -66,6 +67,275 @@ RASTER_EXTENSIONS = {".tif", ".tiff", ".img", ".vrt", ".jp2"}
 RASTER_SEARCH_DIRS = [RASTER_DIR, DATA_DIR]
 CSV_EXTENSIONS = {".csv"}
 SUPPORTED_UPLOAD_EXTENSIONS = CSV_EXTENSIONS | RASTER_EXTENSIONS
+
+
+THEME_PALETTES = {
+    "Light": {
+        "color_scheme": "light",
+        "background": "#F5FAF6",
+        "sidebar": "#EDF5EF",
+        "surface": "rgba(255, 255, 255, 0.92)",
+        "surface_strong": "#FFFFFF",
+        "text": "#143024",
+        "muted": "#4B6858",
+        "border": "rgba(25, 76, 52, 0.20)",
+        "accent": "#24764B",
+        "accent_hover": "#195D39",
+        "accent_soft": "rgba(36, 118, 75, 0.12)",
+        "shadow": "0 12px 34px rgba(23, 63, 43, 0.08)",
+    },
+    "Dark": {
+        "color_scheme": "dark",
+        "background": "#0D1210",
+        "sidebar": "#141B17",
+        "surface": "rgba(27, 36, 31, 0.92)",
+        "surface_strong": "#202A24",
+        "text": "#F1F5F2",
+        "muted": "#AAB9AF",
+        "border": "rgba(232, 242, 235, 0.16)",
+        "accent": "#61BD83",
+        "accent_hover": "#7DD39B",
+        "accent_soft": "rgba(97, 189, 131, 0.15)",
+        "shadow": "0 14px 40px rgba(0, 0, 0, 0.24)",
+    },
+    "Forest": {
+        "color_scheme": "dark",
+        "background": "#071D15",
+        "sidebar": "#0B271D",
+        "surface": "rgba(17, 53, 40, 0.90)",
+        "surface_strong": "#123B2C",
+        "text": "#F2F7F3",
+        "muted": "#B8CBBF",
+        "border": "rgba(216, 239, 224, 0.18)",
+        "accent": "#55B67A",
+        "accent_hover": "#72CB92",
+        "accent_soft": "rgba(85, 182, 122, 0.17)",
+        "shadow": "0 16px 44px rgba(0, 8, 5, 0.30)",
+    },
+}
+
+
+def apply_app_theme(theme_name: str) -> None:
+    """Apply a local three-mode theme without depending on remote assets."""
+    palette = THEME_PALETTES.get(theme_name, THEME_PALETTES["Forest"])
+
+    st.markdown(
+        f"""
+        <style>
+          :root {{
+            color-scheme: {palette['color_scheme']};
+            --canopy-bg: {palette['background']};
+            --canopy-sidebar: {palette['sidebar']};
+            --canopy-surface: {palette['surface']};
+            --canopy-surface-strong: {palette['surface_strong']};
+            --canopy-text: {palette['text']};
+            --canopy-muted: {palette['muted']};
+            --canopy-border: {palette['border']};
+            --canopy-accent: {palette['accent']};
+            --canopy-accent-hover: {palette['accent_hover']};
+            --canopy-accent-soft: {palette['accent_soft']};
+            --canopy-shadow: {palette['shadow']};
+          }}
+
+          .stApp,
+          [data-testid="stAppViewContainer"] {{
+            background: var(--canopy-bg);
+            color: var(--canopy-text);
+          }}
+
+          [data-testid="stAppViewContainer"] > section,
+          [data-testid="stSidebar"] > div {{
+            position: relative;
+            z-index: 1;
+          }}
+
+          [data-testid="stHeader"] {{
+            background: var(--canopy-bg);
+          }}
+
+          [data-testid="stDecoration"] {{
+            background: var(--canopy-accent);
+          }}
+
+          [data-testid="stSidebar"] {{
+            position: relative;
+            overflow: hidden;
+            background: var(--canopy-sidebar);
+            border-right: 1px solid var(--canopy-border);
+          }}
+
+          .stApp h1, .stApp h2, .stApp h3, .stApp h4,
+          .stApp p, .stApp label, .stApp li,
+          .stApp [data-testid="stMarkdownContainer"],
+          .stApp [data-testid="stCaptionContainer"],
+          .stApp [data-testid="stMetricValue"],
+          .stApp [data-testid="stMetricLabel"] {{
+            color: var(--canopy-text);
+          }}
+
+          .stApp [data-testid="stCaptionContainer"],
+          .stApp small {{
+            color: var(--canopy-muted);
+          }}
+
+          [data-testid="stMetric"] {{
+            min-height: 108px;
+            padding: 1rem 1.05rem;
+            background: var(--canopy-surface);
+            border: 1px solid var(--canopy-border);
+            border-left: 3px solid var(--canopy-accent);
+            border-radius: 10px;
+            box-shadow: var(--canopy-shadow);
+          }}
+
+          [data-testid="stAlert"],
+          [data-testid="stExpander"],
+          [data-testid="stChatMessage"] {{
+            background: var(--canopy-surface);
+            color: var(--canopy-text);
+            border: 1px solid var(--canopy-border);
+            border-radius: 10px;
+            box-shadow: var(--canopy-shadow);
+          }}
+
+          [data-testid="stExpander"] details,
+          [data-testid="stExpander"] summary {{
+            background: var(--canopy-surface-strong) !important;
+            color: var(--canopy-text) !important;
+          }}
+
+          [data-testid="stExpander"] summary:hover,
+          [data-testid="stExpander"] summary:focus-visible {{
+            background: var(--canopy-accent-soft) !important;
+            color: var(--canopy-text) !important;
+          }}
+
+          [data-testid="stExpander"] summary svg {{
+            color: var(--canopy-text) !important;
+            fill: currentColor;
+          }}
+
+          .stApp code {{
+            background: var(--canopy-accent-soft) !important;
+          }}
+
+          .stButton > button,
+          [data-testid="stSidebar"] button,
+          [data-testid="stPopover"] button,
+          button[data-testid="stBaseButton-secondary"] {{
+            background: var(--canopy-surface) !important;
+            color: var(--canopy-text) !important;
+            border: 1px solid var(--canopy-border) !important;
+            border-radius: 8px;
+            transition: background-color 150ms ease, border-color 150ms ease, transform 150ms ease;
+          }}
+
+          .stButton > button:hover,
+          [data-testid="stSidebar"] button:hover,
+          [data-testid="stPopover"] button:hover,
+          button[data-testid="stBaseButton-secondary"]:hover {{
+            background: var(--canopy-accent-soft) !important;
+            color: var(--canopy-text) !important;
+            border-color: var(--canopy-accent) !important;
+            transform: translateY(-1px);
+          }}
+
+          .stButton button p,
+          [data-testid="stPopover"] button p,
+          .stButton button span,
+          [data-testid="stPopover"] button span {{
+            color: inherit !important;
+          }}
+
+          [data-baseweb="select"] > div,
+          [data-baseweb="input"] > div,
+          [data-testid="stTextInputRootElement"],
+          [data-testid="stChatInput"],
+          [data-testid="stChatInput"] > div,
+          [data-testid="stChatInput"] [data-baseweb="textarea"] {{
+            background: var(--canopy-surface-strong) !important;
+            color: var(--canopy-text) !important;
+            border-color: var(--canopy-border) !important;
+          }}
+
+          [data-testid="stBottom"],
+          [data-testid="stBottom"] > div,
+          [data-testid="stBottomBlockContainer"] {{
+            background: var(--canopy-bg) !important;
+          }}
+
+          [data-baseweb="select"] *,
+          [data-baseweb="input"] * {{
+            color: var(--canopy-text);
+          }}
+
+          [data-testid="stChatInput"] textarea {{
+            background: var(--canopy-surface-strong) !important;
+            color: var(--canopy-text) !important;
+            -webkit-text-fill-color: var(--canopy-text) !important;
+            caret-color: var(--canopy-accent-hover);
+          }}
+
+          [data-testid="stChatInput"] textarea::placeholder {{
+            color: var(--canopy-muted) !important;
+            -webkit-text-fill-color: var(--canopy-muted) !important;
+            opacity: 1;
+          }}
+
+          [data-testid="stChatInput"] button {{
+            color: var(--canopy-text) !important;
+            background: var(--canopy-accent-soft) !important;
+          }}
+
+          [data-testid="stChatInput"] button:disabled {{
+            color: var(--canopy-muted) !important;
+            opacity: 0.65;
+          }}
+
+          [data-testid="stChatInput"] button svg {{
+            fill: currentColor;
+          }}
+
+          [data-testid="stSegmentedControl"] [role="group"] {{
+            display: flex;
+            width: 100%;
+          }}
+
+          [data-testid="stSegmentedControl"] button {{
+            flex: 1 1 0;
+            min-width: 0;
+            white-space: nowrap;
+            justify-content: center;
+          }}
+
+          .stApp a,
+          .stApp code {{
+            color: var(--canopy-accent-hover);
+          }}
+
+          .stApp hr {{
+            border-color: var(--canopy-border);
+          }}
+
+          @media (max-width: 760px) {{
+            [data-testid="stMetric"] {{
+              min-height: 92px;
+              padding: 0.8rem;
+            }}
+
+          }}
+
+          @media (prefers-reduced-motion: reduce) {{
+            .stButton > button,
+            .stPopover > button,
+            [data-testid="stBaseButton-secondary"] {{
+              transition: none;
+            }}
+          }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # -----------------------------
@@ -945,6 +1215,7 @@ def make_raster_footprint_map(raster_layers: List[Dict[str, Any]]) -> Optional[f
         location=[center_lat, center_lon],
         zoom_start=6,
         tiles=MAP_TILE_OPTIONS["Light"]["tiles"],
+        attr=MAP_TILE_OPTIONS["Light"]["attr"],
         control_scale=True,
     )
 
@@ -3232,7 +3503,7 @@ def render_assistant_results(
                 elif m is not None:
                     map_output = st_folium(
                         m,
-                        width=1000,
+                        use_container_width=True,
                         height=600,
                         key=f"map::{csv_name}::{active_chat_id}::{message_index}::{result_index}",
                         returned_objects=["all_drawings"],
@@ -3347,6 +3618,11 @@ if st.session_state.get("app_state_version") != APP_STATE_VERSION:
             del st.session_state[key]
     st.session_state["app_state_version"] = APP_STATE_VERSION
 
+if st.session_state.get("app_theme") not in THEME_PALETTES:
+    st.session_state["app_theme"] = "Forest"
+
+apply_app_theme(st.session_state["app_theme"])
+
 st.title(APP_NAME)
 st.write("Ask questions across forestry, tree inventory, and spatial datasets. The app answers from the selected data and maps results when coordinates are usable.")
 
@@ -3385,6 +3661,15 @@ selected_dataset_label = st.sidebar.selectbox(
     key="dataset_selector",
 )
 dataset_kind, dataset_path = dataset_options[dataset_labels.index(selected_dataset_label)]
+
+st.sidebar.segmented_control(
+    "Theme",
+    list(THEME_PALETTES),
+    selection_mode="single",
+    key="app_theme",
+    width="stretch",
+    help="Choose the interface palette used throughout the application.",
+)
 
 models = get_installed_ollama_models()
 question_preferred_order = ["qwen2.5:3b", "qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b"]
@@ -3586,7 +3871,7 @@ if dataset_kind == "raster":
             st.caption("The colored layer shows actual Band 1 pixel values using a display stretch; it is not a class legend.")
         st_folium(
             raster_footprint_map,
-            width=1000,
+            use_container_width=True,
             height=500,
             key=f"selected-raster-footprint::{dataset_path.name}",
         )

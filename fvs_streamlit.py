@@ -112,7 +112,7 @@ def _render_result(
         if result_map is not None:
             st_folium(
                 result_map,
-                width=1100,
+                use_container_width=True,
                 height=600,
                 key=f"fvs-map::{active_chat_id}::{message_index}",
             )
