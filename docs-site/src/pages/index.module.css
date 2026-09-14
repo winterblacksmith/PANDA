@@ -1,0 +1,45 @@
+.hero {
+  padding: 5rem 0 4.25rem;
+  background: #fbfaf5;
+  border-bottom: 1px solid #dfe5dc;
+}
+
+.heroGrid { display: grid; grid-template-columns: 0.92fr 1.08fr; gap: 5rem; align-items: center; }
+.hero h1 { color: #103b2a; font-size: clamp(3rem, 5vw, 5.25rem); line-height: 0.98; letter-spacing: -0.045em; max-width: 760px; }
+.kicker { color: #51705a; font-size: .78rem; font-weight: 750; letter-spacing: .14em; text-transform: uppercase; }
+.lede { color: #31473b; font-size: 1.3rem; line-height: 1.65; max-width: 680px; }
+.actions { display: flex; align-items: center; gap: 1.5rem; margin-top: 2rem; }
+.textLink { color: #173f2b; font-weight: 700; }
+.heroFigure { margin: 0; }
+.heroFigure img { width: 100%; aspect-ratio: 1.65; object-fit: cover; object-position: 50% 42%; border: 1px solid #cdd7cc; box-shadow: 0 22px 60px rgba(28, 56, 39, .12); }
+.heroFigure figcaption { margin-top: .65rem; color: #657369; font-size: .78rem; }
+
+.flowSection { padding: 4rem 0; background: #fff; border-bottom: 1px solid #e0e6df; }
+.flowSection h2, .guides h2 { color: #173f2b; font-size: 2rem; }
+.flow { display: grid; grid-template-columns: repeat(5, 1fr); border-top: 1px solid #cfd9ce; margin-top: 2rem; }
+.flowStep { position: relative; display: flex; flex-direction: column; gap: .45rem; padding: 1.4rem 1.4rem 0 0; }
+.flowStep:not(:last-child)::after { content: '→'; position: absolute; right: .85rem; top: 1.75rem; color: #839587; }
+.flowStep span { color: #5a7c64; font-size: .75rem; font-weight: 800; letter-spacing: .08em; }
+.flowStep strong { color: #173f2b; }
+.flowStep small { color: #66736b; line-height: 1.45; max-width: 145px; }
+
+.guides { padding: 4.5rem 0 6rem; background: #f5f6f1; }
+.guideGrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin-top: 2rem; background: #cdd7cc; border: 1px solid #cdd7cc; }
+.guideGrid article { background: #fff; padding: 2rem; min-height: 290px; }
+.guideGrid h3 { color: #173f2b; font-size: 1.45rem; margin-top: 1.25rem; }
+.guideGrid p { color: #536259; min-height: 78px; line-height: 1.65; }
+.guideMark { display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; background: #173f2b; color: white; font: 750 .75rem var(--ifm-font-family-monospace); }
+
+@media (max-width: 996px) {
+  .heroGrid { grid-template-columns: 1fr; gap: 2.5rem; }
+  .flow { grid-template-columns: 1fr 1fr; }
+  .guideGrid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 560px) {
+  .hero { padding-top: 3rem; }
+  .hero h1 { font-size: 3rem; }
+  .actions { align-items: flex-start; flex-direction: column; }
+  .flow { grid-template-columns: 1fr; }
+  .flowStep:not(:last-child)::after { display: none; }
+}

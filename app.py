@@ -1,16 +1,25 @@
 from pathlib import Path
+import base64
+from io import BytesIO
 import json
+import pickle
 import re
+import sqlite3
+import struct
+import zlib
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 import folium
+import numpy as np
 import ollama
 import pandas as pd
 import streamlit as st
+from PIL import Image
 from folium.plugins import Draw
 from streamlit_folium import st_folium
+from fvs_integration import discover_fvs_csvs
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -19,6 +28,9 @@ except Exception:
 
 
 DATA_DIR = Path("data")
+RASTER_DIR = Path("rasters")
+STORAGE_DIR = Path("storage")
+SQLITE_DB_PATH = STORAGE_DIR / "canopy.sqlite"
 APP_STATE_VERSION = "stable_chat_tree_ai_2026_06_04_v1"
 APP_NAME = "Canopy"
 APP_DESCRIPTION = (
@@ -50,6 +62,11 @@ MAP_TILE_OPTIONS = {
     },
 }
 
+RASTER_EXTENSIONS = {".tif", ".tiff", ".img", ".vrt", ".jp2"}
+RASTER_SEARCH_DIRS = [RASTER_DIR, DATA_DIR]
+CSV_EXTENSIONS = {".csv"}
+SUPPORTED_UPLOAD_EXTENSIONS = CSV_EXTENSIONS | RASTER_EXTENSIONS
+
 
 # -----------------------------
 # File and model helpers
@@ -58,8 +75,117 @@ MAP_TILE_OPTIONS = {
 def get_tree_csv_files() -> List[Path]:
     return sorted([
         file for file in DATA_DIR.glob("*.csv")
-        if "Column_Headers" not in file.name
+        if not file.name.startswith("._") and "Column_Headers" not in file.name
     ])
+
+
+def get_raster_files() -> List[Path]:
+    files: List[Path] = []
+    seen_paths = set()
+
+    for raster_dir in RASTER_SEARCH_DIRS:
+        if not raster_dir.exists():
+            continue
+
+        for file in sorted(raster_dir.rglob("*")):
+            if (
+                not file.is_file()
+                or file.name.startswith("._")
+                or file.suffix.lower() not in RASTER_EXTENSIONS
+            ):
+                continue
+
+            resolved_path = file.resolve()
+            if resolved_path in seen_paths:
+                continue
+
+            seen_paths.add(resolved_path)
+            files.append(file)
+
+    preferred_files: Dict[Tuple[str, int, int], Path] = {}
+    for file in files:
+        signature = (
+            file.name.lower(),
+            file.stat().st_size,
+            file.stat().st_mtime_ns,
+        )
+        current = preferred_files.get(signature)
+        direct_companion_count = sum(
+            (file.parent / companion_name).exists()
+            for companion_name in [
+                file.name + ".vat.dbf",
+                file.name + ".xml",
+                file.name + ".aux.xml",
+                file.with_suffix(".tfw").name,
+            ]
+        )
+        current_companion_count = -1
+        if current is not None:
+            current_companion_count = sum(
+                (current.parent / companion_name).exists()
+                for companion_name in [
+                    current.name + ".vat.dbf",
+                    current.name + ".xml",
+                    current.name + ".aux.xml",
+                    current.with_suffix(".tfw").name,
+                ]
+            )
+        if current is None or direct_companion_count > current_companion_count:
+            preferred_files[signature] = file
+
+    return sorted(preferred_files.values())
+
+
+def get_dataset_options() -> List[Tuple[str, Path]]:
+    fvs_options = [("fvs", path) for path in discover_fvs_csvs(DATA_DIR)]
+    csv_options = [("csv", path) for path in get_tree_csv_files()]
+    raster_options = [("raster", path) for path in get_raster_files()]
+    return fvs_options + csv_options + raster_options
+
+
+def format_dataset_option(option: Tuple[str, Path]) -> str:
+    dataset_kind, path = option
+    if dataset_kind == "fvs":
+        label = "FVS stands + shapefile"
+    elif dataset_kind == "raster":
+        label = "Raster"
+    else:
+        label = "CSV"
+    if dataset_kind == "raster" and path.parent != RASTER_DIR:
+        try:
+            folder = path.parent.relative_to(RASTER_DIR)
+            return f"{path.name} ({label} - {folder})"
+        except ValueError:
+            pass
+    return f"{path.name} ({label})"
+
+
+def save_uploaded_dataset(uploaded_file: Any) -> Tuple[Optional[Path], Optional[str]]:
+    safe_name = Path(str(uploaded_file.name)).name
+    extension = Path(safe_name).suffix.lower()
+    if extension not in SUPPORTED_UPLOAD_EXTENSIONS:
+        return None, f"Unsupported file type: `{extension or 'none'}`."
+
+    file_bytes = uploaded_file.getvalue()
+    if not file_bytes:
+        return None, "The uploaded file is empty."
+
+    if extension in CSV_EXTENSIONS:
+        try:
+            pd.read_csv(BytesIO(file_bytes), nrows=5)
+        except Exception as exc:
+            return None, f"The CSV could not be read: {exc}"
+        target_dir = DATA_DIR
+    else:
+        target_dir = RASTER_DIR
+
+    target_dir.mkdir(exist_ok=True)
+    target_path = target_dir / safe_name
+    if target_path.exists():
+        return None, f"A dataset named `{safe_name}` already exists. Rename the file before importing it again."
+
+    target_path.write_bytes(file_bytes)
+    return target_path, None
 
 
 def get_installed_ollama_models() -> List[str]:
@@ -86,6 +212,1084 @@ def load_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+def ensure_storage_dirs() -> None:
+    STORAGE_DIR.mkdir(exist_ok=True)
+    RASTER_DIR.mkdir(exist_ok=True)
+
+
+def safe_sql_identifier(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_").lower()
+    return cleaned or "dataset"
+
+
+def quote_sql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def get_sql_table_name(csv_name: str) -> str:
+    stem = Path(csv_name).stem
+    return "dataset_" + safe_sql_identifier(stem)
+
+
+def get_sql_connection() -> sqlite3.Connection:
+    ensure_storage_dirs()
+    return sqlite3.connect(SQLITE_DB_PATH)
+
+
+def ensure_chat_tables() -> None:
+    with get_sql_connection() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS chat_conversations (
+                id TEXT PRIMARY KEY,
+                dataset_key TEXT NOT NULL,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chat_conversations_dataset
+            ON chat_conversations(dataset_key, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                conversation_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                message_blob BLOB NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (conversation_id, position),
+                FOREIGN KEY (conversation_id) REFERENCES chat_conversations(id) ON DELETE CASCADE
+            );
+            """
+        )
+
+
+def encode_chat_message(message: Dict[str, Any]) -> bytes:
+    return zlib.compress(pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL))
+
+
+def decode_chat_message(message_blob: bytes) -> Dict[str, Any]:
+    return pickle.loads(zlib.decompress(message_blob))
+
+
+def load_saved_chats(dataset_key: str) -> Dict[str, Any]:
+    ensure_chat_tables()
+    chats: Dict[str, Any] = {}
+
+    with get_sql_connection() as conn:
+        conversations = conn.execute(
+            """
+            SELECT id, title
+            FROM chat_conversations
+            WHERE dataset_key = ?
+            ORDER BY updated_at DESC, created_at DESC
+            """,
+            (dataset_key,),
+        ).fetchall()
+
+        for conversation_id, title in conversations:
+            message_rows = conn.execute(
+                """
+                SELECT message_blob
+                FROM chat_messages
+                WHERE conversation_id = ?
+                ORDER BY position
+                """,
+                (conversation_id,),
+            ).fetchall()
+            messages = []
+            for (message_blob,) in message_rows:
+                try:
+                    messages.append(decode_chat_message(message_blob))
+                except Exception:
+                    continue
+            chats[conversation_id] = {"title": title, "messages": messages}
+
+    return chats
+
+
+def save_chat(dataset_key: str, conversation_id: str, chat: Dict[str, Any]) -> None:
+    ensure_chat_tables()
+    with get_sql_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO chat_conversations (id, dataset_key, title)
+            VALUES (?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                dataset_key = excluded.dataset_key,
+                title = excluded.title,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (conversation_id, dataset_key, chat.get("title", "New chat")),
+        )
+        conn.execute(
+            "DELETE FROM chat_messages WHERE conversation_id = ?",
+            (conversation_id,),
+        )
+        conn.executemany(
+            """
+            INSERT INTO chat_messages (conversation_id, position, message_blob)
+            VALUES (?, ?, ?)
+            """,
+            [
+                (conversation_id, position, encode_chat_message(message))
+                for position, message in enumerate(chat.get("messages", []))
+            ],
+        )
+
+
+def sync_dataframe_to_sqlite(csv_name: str, df: pd.DataFrame) -> str:
+    table_name = get_sql_table_name(csv_name)
+
+    with get_sql_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dataset_registry (
+                csv_name TEXT PRIMARY KEY,
+                table_name TEXT NOT NULL,
+                row_count INTEGER NOT NULL,
+                column_count INTEGER NOT NULL,
+                synced_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        existing = conn.execute(
+            "SELECT row_count, column_count FROM dataset_registry WHERE csv_name = ?",
+            (csv_name,),
+        ).fetchone()
+
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone() is not None
+
+        if not table_exists or existing != (len(df), len(df.columns)):
+            df.to_sql(table_name, conn, if_exists="replace", index=True, index_label="__rowid")
+            conn.execute(
+                """
+                INSERT INTO dataset_registry (csv_name, table_name, row_count, column_count, synced_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(csv_name) DO UPDATE SET
+                    table_name = excluded.table_name,
+                    row_count = excluded.row_count,
+                    column_count = excluded.column_count,
+                    synced_at = CURRENT_TIMESTAMP
+                """,
+                (csv_name, table_name, len(df), len(df.columns)),
+            )
+
+    return table_name
+
+
+def get_sqlite_database_overview() -> pd.DataFrame:
+    rows = []
+    with get_sql_connection() as conn:
+        table_names = [
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+                """
+            ).fetchall()
+        ]
+        for table_name in table_names:
+            row_count = conn.execute(
+                f"SELECT COUNT(*) FROM {quote_sql_identifier(table_name)}"
+            ).fetchone()[0]
+            if table_name.startswith("dataset_"):
+                purpose = "Imported CSV data"
+            elif table_name == "dataset_registry":
+                purpose = "CSV import registry"
+            elif table_name == "chat_conversations":
+                purpose = "Saved chats"
+            elif table_name == "chat_messages":
+                purpose = "Saved chat messages"
+            else:
+                purpose = "Application data"
+            rows.append({"Table": table_name, "Purpose": purpose, "Rows": int(row_count)})
+    return pd.DataFrame(rows)
+
+
+def get_sqlite_table_columns(table_name: str) -> pd.DataFrame:
+    with get_sql_connection() as conn:
+        rows = conn.execute(
+            f"PRAGMA table_info({quote_sql_identifier(table_name)})"
+        ).fetchall()
+    return pd.DataFrame(
+        rows,
+        columns=["Position", "Column", "SQL type", "Required", "Default", "Primary key"],
+    )
+
+
+def preview_sqlite_table(table_name: str, limit: int = 25) -> pd.DataFrame:
+    sql = f"SELECT * FROM {quote_sql_identifier(table_name)} LIMIT ?"
+    with get_sql_connection() as conn:
+        return pd.read_sql_query(sql, conn, params=[int(limit)])
+
+
+def build_sql_where_clause(schema: Dict[str, Any], instructions: Dict[str, Any]) -> Tuple[List[str], List[Any], List[str], List[str]]:
+    roles = schema["roles"]
+    where_parts: List[str] = []
+    params: List[Any] = []
+    filters: List[str] = []
+    warnings: List[str] = []
+
+    species_cols = [roles.get("species_common"), roles.get("scientific_name")]
+    species_cols = [col for col in species_cols if col]
+
+    if instructions.get("species_text"):
+        if species_cols:
+            species_parts = []
+
+            for col in species_cols:
+                species_parts.append(f"LOWER(CAST({quote_sql_identifier(col)} AS TEXT)) LIKE ?")
+                params.append("%" + str(instructions["species_text"]).lower() + "%")
+
+            where_parts.append("(" + " OR ".join(species_parts) + ")")
+            filters.append("species fields contain '" + str(instructions["species_text"]) + "'")
+        else:
+            warnings.append("I could not find a species/common-name column in this CSV.")
+
+    if instructions.get("native_text"):
+        native_col = roles.get("native_status")
+
+        if native_col:
+            where_parts.append(f"LOWER(CAST({quote_sql_identifier(native_col)} AS TEXT)) LIKE ?")
+            params.append("%" + str(instructions["native_text"]).lower() + "%")
+            filters.append(native_col + " contains '" + str(instructions["native_text"]) + "'")
+        else:
+            warnings.append("This CSV does not appear to contain a native-status column, so native-tree questions cannot be answered from this file.")
+
+    diameter_col = roles.get("diameter_numeric")
+
+    if diameter_col and (instructions.get("min_diameter") is not None or instructions.get("max_diameter") is not None):
+        if instructions.get("min_diameter") is not None:
+            where_parts.append(f"CAST({quote_sql_identifier(diameter_col)} AS REAL) >= ?")
+            params.append(float(instructions["min_diameter"]))
+            filters.append(diameter_col + " >= " + str(instructions["min_diameter"]))
+
+        if instructions.get("max_diameter") is not None:
+            where_parts.append(f"CAST({quote_sql_identifier(diameter_col)} AS REAL) <= ?")
+            params.append(float(instructions["max_diameter"]))
+            filters.append(diameter_col + " <= " + str(instructions["max_diameter"]))
+    elif not diameter_col and (instructions.get("min_diameter") is not None or instructions.get("max_diameter") is not None):
+        warnings.append("I could not find a numeric diameter/DBH column in this CSV.")
+
+    danger_col = roles.get("danger_flag")
+
+    if instructions.get("danger_value") is not None:
+        if danger_col:
+            where_parts.append(f"CAST({quote_sql_identifier(danger_col)} AS REAL) = ?")
+            params.append(float(instructions["danger_value"]))
+            filters.append(danger_col + " = " + str(instructions["danger_value"]))
+        else:
+            warnings.append("I could not find a danger/hazard flag column in this CSV.")
+
+    if not filters:
+        filters.append("No filters applied")
+
+    return where_parts, params, filters, warnings
+
+
+def run_filtered_query_sql(
+    csv_name: str,
+    df: pd.DataFrame,
+    schema: Dict[str, Any],
+    instructions: Dict[str, Any],
+) -> Tuple[pd.DataFrame, List[str], List[str], str, List[Any]]:
+    table_name = sync_dataframe_to_sqlite(csv_name, df)
+    where_parts, params, filters, warnings = build_sql_where_clause(schema, instructions)
+    sql = f"SELECT * FROM {quote_sql_identifier(table_name)}"
+
+    if where_parts:
+        sql += " WHERE " + " AND ".join(where_parts)
+
+    with get_sql_connection() as conn:
+        result = pd.read_sql_query(sql, conn, params=params)
+
+    if "__rowid" in result.columns:
+        result = result.set_index("__rowid", drop=True)
+        result.index.name = None
+
+    return result, filters, warnings, sql, params
+
+
+def find_raster_companion(path: Path, companion_name: str) -> Optional[Path]:
+    direct_candidate = path.parent / companion_name
+    if direct_candidate.exists():
+        return direct_candidate
+
+    matches = []
+    for raster_dir in RASTER_SEARCH_DIRS:
+        if raster_dir.exists():
+            matches.extend(raster_dir.rglob(companion_name))
+
+    if not matches:
+        return None
+
+    matching_package = [
+        match
+        for match in matches
+        if match.parent.name.lower() == path.stem.lower()
+    ]
+    return sorted(matching_package or matches)[0]
+
+
+def get_raster_companion_paths(path: Path) -> Dict[str, Path]:
+    return {
+        key: companion
+        for key, companion in {
+            "attribute_table": find_raster_companion(path, path.name + ".vat.dbf"),
+            "metadata": find_raster_companion(path, path.name + ".xml"),
+            "auxiliary_metadata": find_raster_companion(path, path.name + ".aux.xml"),
+            "world_file": find_raster_companion(path, path.with_suffix(".tfw").name),
+        }.items()
+        if companion is not None
+    }
+
+
+def get_raster_companion_signature(path: Path) -> Tuple[Tuple[str, float], ...]:
+    return tuple(
+        sorted(
+            (key, companion.stat().st_mtime)
+            for key, companion in get_raster_companion_paths(path).items()
+        )
+    )
+
+
+@st.cache_data(show_spinner=False)
+def read_dbf_table(path_text: str, modified_time: float) -> pd.DataFrame:
+    del modified_time
+    with open(path_text, "rb") as dbf_file:
+        header = dbf_file.read(32)
+        if len(header) < 32:
+            raise ValueError("The DBF header is incomplete.")
+
+        record_count = struct.unpack("<I", header[4:8])[0]
+        header_length = struct.unpack("<H", header[8:10])[0]
+        record_length = struct.unpack("<H", header[10:12])[0]
+        fields = []
+
+        while True:
+            descriptor = dbf_file.read(32)
+            if not descriptor or descriptor[0] == 0x0D:
+                break
+            fields.append({
+                "name": descriptor[:11].split(b"\x00", 1)[0].decode("latin-1"),
+                "type": chr(descriptor[11]),
+                "length": descriptor[16],
+                "decimals": descriptor[17],
+            })
+
+        dbf_file.seek(header_length)
+        records = []
+        for _ in range(record_count):
+            record = dbf_file.read(record_length)
+            if len(record) < record_length:
+                break
+            if record[0] == 0x2A:
+                continue
+
+            offset = 1
+            parsed = {}
+            for field in fields:
+                raw_value = record[offset:offset + field["length"]].decode(
+                    "latin-1",
+                    errors="replace",
+                ).strip()
+                offset += field["length"]
+                parsed[field["name"]] = raw_value or None
+            records.append(parsed)
+
+    table = pd.DataFrame(records)
+    for field in fields:
+        column = field["name"]
+        if column not in table.columns or field["type"] not in {"N", "F"}:
+            continue
+        if column == "PLT_CN":
+            table[column] = table[column].astype("string").str.replace(r"\.0+$", "", regex=True)
+            continue
+        table[column] = pd.to_numeric(table[column], errors="coerce")
+        if field["decimals"] == 0:
+            table[column] = table[column].astype("Int64")
+
+    return table
+
+
+@st.cache_data(show_spinner=False)
+def read_raster_product_metadata(path_text: str, modified_time: float) -> Dict[str, Any]:
+    import xml.etree.ElementTree as ET
+
+    del modified_time
+    root = ET.parse(path_text).getroot()
+    title = root.findtext(".//resTitle")
+    abstract = root.findtext(".//idAbs")
+    entity_overview = root.findtext(".//eaover") or ""
+    value_match = re.search(
+        r"(?:^|\n)Value\s*=\s*(.+?)(?=\n[A-Za-z][A-Za-z0-9_]*\s*=|\Z)",
+        entity_overview,
+        flags=re.DOTALL,
+    )
+
+    value_definition = value_match.group(1).strip() if value_match else None
+    band_role = "TM_ID" if "Equivalent to “TM_ID”" in entity_overview or "Equivalent to \"TM_ID\"" in entity_overview else None
+    resolution = "30 x 30 meters" if re.search(r"30[×x]30\s*(?:meter|m)", entity_overview + "\n" + (abstract or ""), re.I) else None
+
+    return {
+        "title": title,
+        "abstract": abstract,
+        "value_definition": value_definition,
+        "band_role": band_role,
+        "resolution_description": resolution,
+    }
+
+
+def attach_raster_companion_data(path: Path, summary: Dict[str, Any]) -> Dict[str, Any]:
+    companions = get_raster_companion_paths(path)
+    summary["companion_files"] = {
+        key: str(companion)
+        for key, companion in companions.items()
+    }
+
+    metadata_path = companions.get("metadata")
+    if metadata_path:
+        try:
+            summary["product_metadata"] = read_raster_product_metadata(
+                str(metadata_path.resolve()),
+                metadata_path.stat().st_mtime,
+            )
+        except Exception as exc:
+            summary["metadata_warning"] = str(exc)
+
+    attribute_path = companions.get("attribute_table")
+    if not attribute_path:
+        return summary
+
+    try:
+        attribute_table = read_dbf_table(
+            str(attribute_path.resolve()),
+            attribute_path.stat().st_mtime,
+        )
+    except Exception as exc:
+        summary["attribute_table_warning"] = str(exc)
+        return summary
+
+    summary["attribute_table"] = attribute_table
+    summary["attribute_rows"] = len(attribute_table)
+    summary["attribute_fields"] = list(attribute_table.columns)
+
+    if {"Value", "Count"}.issubset(attribute_table.columns):
+        lookup_columns = [
+            column
+            for column in [
+                "Value",
+                "TM_ID",
+                "ForTypName",
+                "FldTypName",
+                "BALIVE",
+                "CANOPYPCT",
+                "STANDHT",
+                "TPA_LIVE",
+            ]
+            if column in attribute_table.columns
+        ]
+        lookup = attribute_table[lookup_columns].copy()
+        top_table = pd.DataFrame(summary.get("top_values", []))
+        if not top_table.empty:
+            top_table = top_table.merge(lookup, on="Value", how="left")
+            summary["top_values"] = top_table.to_dict("records")
+
+    if {"ForTypName", "Count"}.issubset(attribute_table.columns):
+        forest_types = (
+            attribute_table.dropna(subset=["ForTypName"])
+            .groupby("ForTypName", as_index=False)["Count"]
+            .sum()
+            .sort_values("Count", ascending=False)
+        )
+        total_pixels = float(forest_types["Count"].sum())
+        forest_types = forest_types.rename(
+            columns={"ForTypName": "Forest type", "Count": "Pixels"}
+        )
+        forest_types["Pixels"] = forest_types["Pixels"].round().astype("Int64")
+        forest_types["Percent of mapped pixels"] = (
+            forest_types["Pixels"].astype(float) / total_pixels * 100
+        ).round(2)
+        summary["forest_type_summary"] = forest_types.to_dict("records")
+
+    return summary
+
+
+def discover_raster_layers() -> List[Dict[str, Any]]:
+    layers: List[Dict[str, Any]] = []
+    seen_paths = set()
+
+    for raster_dir in RASTER_SEARCH_DIRS:
+        if not raster_dir.exists():
+            continue
+
+        for path in sorted(raster_dir.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in RASTER_EXTENSIONS:
+                continue
+
+            resolved_path = path.resolve()
+            if resolved_path in seen_paths:
+                continue
+
+            seen_paths.add(resolved_path)
+
+            layer = {
+                "name": path.name,
+                "folder": str(path.parent),
+                "path": str(path),
+                "size_mb": round(path.stat().st_size / (1024 * 1024), 2),
+                "driver": "Unknown",
+                "crs": "Unknown",
+                "width": None,
+                "height": None,
+                "bands": None,
+                "bounds": None,
+                "rasterio_available": False,
+            }
+
+            try:
+                import rasterio
+
+                with rasterio.open(path) as src:
+                    layer.update({
+                        "driver": src.driver,
+                        "crs": str(src.crs) if src.crs else "Unknown",
+                        "width": src.width,
+                        "height": src.height,
+                        "bands": src.count,
+                        "bounds": tuple(round(value, 6) for value in src.bounds),
+                        "resolution": tuple(round(value, 6) for value in src.res),
+                        "band_descriptions": list(src.descriptions),
+                        "units": list(src.units),
+                        "rasterio_available": True,
+                    })
+
+                    if src.crs:
+                        try:
+                            from rasterio.warp import transform_bounds
+
+                            west, south, east, north = transform_bounds(
+                                src.crs,
+                                "EPSG:4326",
+                                *src.bounds,
+                                densify_pts=21,
+                            )
+                            layer["bounds_wgs84"] = (
+                                round(west, 6),
+                                round(south, 6),
+                                round(east, 6),
+                                round(north, 6),
+                            )
+                        except Exception as bounds_exc:
+                            layer["bounds_transform_error"] = str(bounds_exc)
+            except Exception as exc:
+                layer["metadata_error"] = str(exc)
+
+            layers.append(layer)
+
+    return layers
+
+
+@st.cache_data(show_spinner=False)
+def read_raster_data_summary(
+    path_text: str,
+    modified_time: float,
+    companion_signature: Tuple[Tuple[str, float], ...] = (),
+) -> Dict[str, Any]:
+    import rasterio
+
+    del modified_time
+    del companion_signature
+    with rasterio.open(path_text) as src:
+        band = src.read(1, masked=True)
+        valid_values = band.compressed()
+        if valid_values.size == 0:
+            return {"valid_pixels": 0, "unique_values": 0, "top_values": []}
+
+        values, counts = np.unique(valid_values, return_counts=True)
+        top_indexes = np.argsort(counts)[::-1][:20]
+        top_values = [
+            {
+                "Value": int(values[index]) if float(values[index]).is_integer() else float(values[index]),
+                "Pixels": int(counts[index]),
+                "Percent of valid pixels": round(float(counts[index] / valid_values.size * 100), 2),
+            }
+            for index in top_indexes
+        ]
+
+        summary = {
+            "valid_pixels": int(valid_values.size),
+            "nodata_pixels": int(band.size - valid_values.size),
+            "minimum": float(valid_values.min()),
+            "maximum": float(valid_values.max()),
+            "mean": float(valid_values.mean()),
+            "median": float(np.median(valid_values)),
+            "unique_values": int(values.size),
+            "top_values": top_values,
+            "band_name": src.descriptions[0] if src.descriptions else None,
+            "unit": src.units[0] if src.units else None,
+            "has_color_table": False,
+        }
+        return attach_raster_companion_data(Path(path_text), summary)
+
+
+@st.cache_data(show_spinner=False)
+def make_raster_overlay(path_text: str, modified_time: float, max_width: int = 900) -> Dict[str, Any]:
+    import rasterio
+    from rasterio.enums import Resampling
+    from rasterio.warp import calculate_default_transform, reproject, transform_bounds
+
+    del modified_time
+    with rasterio.open(path_text) as src:
+        if not src.crs:
+            return {}
+
+        west, south, east, north = transform_bounds(src.crs, "EPSG:4326", *src.bounds, densify_pts=21)
+        transform, projected_width, projected_height = calculate_default_transform(
+            src.crs,
+            "EPSG:4326",
+            src.width,
+            src.height,
+            *src.bounds,
+        )
+        scale = min(1.0, max_width / max(projected_width, 1))
+        width = max(1, int(projected_width * scale))
+        height = max(1, int(projected_height * scale))
+        transform = transform * transform.scale(projected_width / width, projected_height / height)
+        destination = np.full((height, width), np.nan, dtype="float32")
+
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=destination,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=src.nodata,
+            dst_transform=transform,
+            dst_crs="EPSG:4326",
+            dst_nodata=np.nan,
+            resampling=Resampling.nearest,
+        )
+
+    valid = np.isfinite(destination)
+    if not valid.any():
+        return {}
+
+    low, high = np.percentile(destination[valid], [2, 98])
+    if high <= low:
+        high = low + 1
+    normalized = np.clip((destination - low) / (high - low), 0, 1)
+    normalized = np.nan_to_num(normalized, nan=0.0)
+
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    rgba[..., 0] = (35 + normalized * 205).astype(np.uint8)
+    rgba[..., 1] = (75 + normalized * 155).astype(np.uint8)
+    rgba[..., 2] = (110 - normalized * 65).astype(np.uint8)
+    rgba[..., 3] = np.where(valid, 205, 0).astype(np.uint8)
+
+    image_buffer = BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(image_buffer, format="PNG")
+    image_data = base64.b64encode(image_buffer.getvalue()).decode("ascii")
+    return {
+        "data_url": f"data:image/png;base64,{image_data}",
+        "bounds": [[south, west], [north, east]],
+        "stretch_minimum": float(low),
+        "stretch_maximum": float(high),
+    }
+
+
+def add_raster_data_overlay(m: folium.Map, layer: Dict[str, Any]) -> bool:
+    path = Path(layer["path"])
+    if not path.exists() or not layer.get("rasterio_available"):
+        return False
+
+    overlay = make_raster_overlay(str(path.resolve()), path.stat().st_mtime)
+    if not overlay:
+        return False
+
+    folium.raster_layers.ImageOverlay(
+        image=overlay["data_url"],
+        bounds=overlay["bounds"],
+        name=f"{layer.get('name', 'Raster')} values",
+        opacity=0.8,
+        interactive=True,
+        cross_origin=False,
+        zindex=2,
+    ).add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+    return True
+
+
+def make_raster_footprint_map(raster_layers: List[Dict[str, Any]]) -> Optional[folium.Map]:
+    footprint_layers = [
+        layer
+        for layer in raster_layers
+        if layer.get("bounds_wgs84") and len(layer.get("bounds_wgs84")) == 4
+    ]
+
+    if not footprint_layers:
+        return None
+
+    first_bounds = footprint_layers[0]["bounds_wgs84"]
+    west, south, east, north = first_bounds
+    center_lat = (south + north) / 2
+    center_lon = (west + east) / 2
+
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=6,
+        tiles=MAP_TILE_OPTIONS["Light"]["tiles"],
+        control_scale=True,
+    )
+
+    all_bounds = []
+
+    for layer in footprint_layers:
+        west, south, east, north = layer["bounds_wgs84"]
+        rectangle_bounds = [[south, west], [north, east]]
+        all_bounds.extend(rectangle_bounds)
+
+        popup_parts = [
+            f"Name: {layer.get('name', 'Raster')}",
+            f"CRS: {layer.get('crs', 'Unknown')}",
+            f"Size: {layer.get('width')} x {layer.get('height')}",
+            f"Bands: {layer.get('bands')}",
+        ]
+
+        folium.Rectangle(
+            bounds=rectangle_bounds,
+            color="#2f80ed",
+            weight=2,
+            fill=True,
+            fill_opacity=0.12,
+            popup="<br>".join(popup_parts),
+        ).add_to(m)
+
+        if len(footprint_layers) == 1:
+            add_raster_data_overlay(m, layer)
+
+    if all_bounds:
+        m.fit_bounds(all_bounds)
+
+    return m
+
+
+def get_raster_layer_for_path(path: Path) -> Dict[str, Any]:
+    selected_path = path.resolve()
+
+    for layer in discover_raster_layers():
+        if Path(layer["path"]).resolve() == selected_path:
+            return layer
+
+    return {
+        "name": path.name,
+        "folder": str(path.parent),
+        "path": str(path),
+        "size_mb": round(path.stat().st_size / (1024 * 1024), 2) if path.exists() else 0,
+        "driver": "Unknown",
+        "crs": "Unknown",
+        "width": None,
+        "height": None,
+        "bands": None,
+        "bounds": None,
+        "rasterio_available": False,
+        "metadata_error": "Raster metadata has not been read yet.",
+    }
+
+
+def format_raster_context(layer: Dict[str, Any]) -> str:
+    data_summary = layer.get("data_summary", {})
+    product_metadata = data_summary.get("product_metadata", {})
+    dominant_forest_types = data_summary.get("forest_type_summary", [])[:10]
+    return "\n".join([
+        f"Name: {layer.get('name', 'Unknown')}",
+        f"Folder: {layer.get('folder', 'Unknown')}",
+        f"Size MB: {layer.get('size_mb', 'Unknown')}",
+        f"Driver: {layer.get('driver', 'Unknown')}",
+        f"CRS: {layer.get('crs', 'Unknown')}",
+        f"Width: {layer.get('width', 'Unknown')}",
+        f"Height: {layer.get('height', 'Unknown')}",
+        f"Bands: {layer.get('bands', 'Unknown')}",
+        f"Native bounds: {layer.get('bounds', 'Unknown')}",
+        f"Geographic bounds: {layer.get('bounds_wgs84', 'Unknown')}",
+        f"Valid pixels: {data_summary.get('valid_pixels', 'Unknown')}",
+        f"NoData pixels: {data_summary.get('nodata_pixels', 'Unknown')}",
+        f"Minimum value: {data_summary.get('minimum', 'Unknown')}",
+        f"Maximum value: {data_summary.get('maximum', 'Unknown')}",
+        f"Mean value: {data_summary.get('mean', 'Unknown')}",
+        f"Median value: {data_summary.get('median', 'Unknown')}",
+        f"Distinct values: {data_summary.get('unique_values', 'Unknown')}",
+        f"Band description: {data_summary.get('band_name') or 'Not embedded in the file'}",
+        f"Unit: {data_summary.get('unit') or 'Not embedded in the file'}",
+        f"Product title: {product_metadata.get('title', 'Not available')}",
+        f"Pixel value meaning: {product_metadata.get('value_definition') or 'Not documented'}",
+        f"Band role: {product_metadata.get('band_role') or 'Not documented'}",
+        f"Resolution description: {product_metadata.get('resolution_description') or layer.get('resolution', 'Unknown')}",
+        f"Raster attribute rows: {data_summary.get('attribute_rows', 0)}",
+        f"Raster attribute fields: {data_summary.get('attribute_fields', [])}",
+        f"Dominant forest types weighted by mapped pixels: {dominant_forest_types}",
+        f"Product abstract: {(product_metadata.get('abstract') or 'Not available')[:1600]}",
+    ])
+
+
+def summarize_raster_layer(layer: Dict[str, Any]) -> str:
+    if not layer.get("rasterio_available"):
+        error = layer.get("metadata_error")
+        if error:
+            return f"I found `{layer.get('name', 'this raster')}`, but I could not read its raster metadata yet: {error}"
+        return f"I found `{layer.get('name', 'this raster')}`, but Rasterio is not available, so I can only see basic file information."
+
+    width = layer.get("width")
+    height = layer.get("height")
+    bands = layer.get("bands")
+    crs = layer.get("crs", "Unknown")
+    bounds = layer.get("bounds_wgs84")
+    data_summary = layer.get("data_summary", {})
+    product_metadata = data_summary.get("product_metadata", {})
+    location_text = f" Its geographic footprint is approximately {bounds}." if bounds else ""
+    value_text = ""
+    if data_summary.get("valid_pixels"):
+        value_text = (
+            f" Band 1 contains {data_summary['valid_pixels']:,} valid pixels and "
+            f"{data_summary['unique_values']:,} distinct values, ranging from "
+            f"{data_summary['minimum']:,.0f} to {data_summary['maximum']:,.0f}."
+        )
+
+    if product_metadata.get("band_role") == "TM_ID" and data_summary.get("attribute_rows"):
+        dominant_types = data_summary.get("forest_type_summary", [])[:3]
+        dominant_text = ", ".join(
+            f"{row['Forest type']} ({row['Percent of mapped pixels']:.1f}%)"
+            for row in dominant_types
+        )
+        return (
+            f"`{layer.get('name')}` is a {layer.get('driver', 'raster')} TreeMap 2022 plot-identifier raster "
+            f"with {bands} band, {width:,} columns by {height:,} rows, using CRS {crs}."
+            f"{location_text}{value_text} Each valid pixel represents a 30 x 30 meter modeled forest cell "
+            f"whose value is a `TM_ID`, linking it to one of {data_summary['attribute_rows']:,} forest plot "
+            f"profiles in the accompanying attribute table. The dominant mapped forest types are {dominant_text}."
+        )
+
+    return (
+        f"`{layer.get('name')}` is a {layer.get('driver', 'raster')} raster with {bands} band(s), "
+        f"{width:,} columns by {height:,} rows, using CRS {crs}."
+        f"{location_text}{value_text} The file does not include a band description, units, or a class legend, "
+        "so its numeric codes cannot be named reliably without accompanying documentation."
+    )
+
+
+def interpret_raster_question(question: str, model_name: str, use_model: bool) -> str:
+    valid_intents = {
+        "summary",
+        "crs",
+        "location",
+        "dimensions",
+        "value_summary",
+        "current_capabilities",
+        "point_sampling",
+        "polygon_analysis",
+        "inventory_connection",
+        "attribute_meaning",
+        "forest_types",
+        "general_chat",
+        "other",
+    }
+
+    if use_model:
+        prompt = f"""
+Classify the user's question about Canopy or its selected raster dataset.
+Return JSON only in this exact shape: {{"intent": "one_label"}}
+
+Allowed labels:
+- summary: asks for an overall raster summary
+- crs: asks about projection or coordinate reference system
+- location: asks where the raster is, its coverage, bounds, or extent
+- dimensions: asks about width, height, bands, file size, or resolution
+- value_summary: asks about pixels, values, statistics, minimum, maximum, mean, median, or distinct values
+- current_capabilities: asks what Canopy can currently do with the raster
+- point_sampling: asks what is needed to sample raster values at points
+- polygon_analysis: asks about drawn polygons, zonal analysis, or values inside an area
+- inventory_connection: asks how the raster connects or joins to a tree inventory or CSV
+- attribute_meaning: asks what Band 1, pixel codes, TM_ID, plot IDs, or raster values represent
+- forest_types: asks which forest types occur, are dominant, or cover the most area
+- general_chat: casual conversation not asking about data or capabilities
+- other: a raster-related question that does not fit another label
+
+User question: {question}
+"""
+        parsed = extract_json(
+            safe_ollama_chat(
+                model_name,
+                prompt,
+                options={"temperature": 0, "num_predict": 40},
+            )
+        )
+        if parsed and parsed.get("intent") in valid_intents:
+            return str(parsed["intent"])
+
+    lowered = question.lower()
+    if "polygon" in lowered or "drawn" in lowered:
+        return "polygon_analysis"
+    if "tree inventory" in lowered or "connect" in lowered or "join" in lowered:
+        return "inventory_connection"
+    if "sample" in lowered or "tree point" in lowered:
+        return "point_sampling"
+    if "forest type" in lowered:
+        return "forest_types"
+    if any(term in lowered for term in ["tm_id", "plot id", "pixel code", "band 1 represent", "values represent"]):
+        return "attribute_meaning"
+    if "canopy" in lowered and any(term in lowered for term in ["do", "support", "right now"]):
+        return "current_capabilities"
+    if "crs" in lowered or "projection" in lowered:
+        return "crs"
+    if any(term in lowered for term in ["where", "located", "location", "extent", "bounds"]):
+        return "location"
+    if any(term in lowered for term in ["dimension", "width", "height", "resolution"]):
+        return "dimensions"
+    if any(term in lowered for term in ["value", "pixel", "minimum", "maximum", "mean", "median", "data"]):
+        return "value_summary"
+    if classify_prompt_type(question) == "general_chat":
+        return "general_chat"
+    return "other"
+
+
+def answer_raster_question(question: str, layer: Dict[str, Any], model_name: str, use_model: bool) -> str:
+    fallback = summarize_raster_layer(layer)
+    lowered = question.lower().strip()
+    data_summary = layer.get("data_summary", {})
+    product_metadata = data_summary.get("product_metadata", {})
+    bounds = layer.get("bounds_wgs84")
+    intent = interpret_raster_question(question, model_name, use_model)
+    has_attribute_table = bool(data_summary.get("attribute_rows"))
+    attribute_capability = (
+        "The accompanying raster attribute table is available, so Canopy can translate TM_ID pixel values into "
+        "forest type, live basal area, canopy percentage, stand height, live trees per acre, biomass, and carbon attributes."
+        if has_attribute_table
+        else "No accompanying raster attribute table is available, so numeric codes cannot be translated into named attributes."
+    )
+
+    focus_contexts = {
+        "current_capabilities": (
+            "Canopy currently reads GeoTIFF metadata, displays the actual Band 1 cells as a color-stretched map "
+            "layer, calculates whole-raster statistics and common numeric values, and reads an accompanying ArcGIS "
+            f"raster attribute table when present. {attribute_capability} It does not yet sample CSV tree points, "
+            "calculate statistics inside drawn polygons, or join raster values to inventory rows."
+        ),
+        "point_sampling": (
+            "Point sampling is not implemented yet. The implementation requires reading tree coordinates from the "
+            "selected CSV, transforming them from their source CRS into this raster's EPSG:5070 CRS, sampling Band 1 "
+            "at each transformed coordinate with Rasterio, and attaching the sampled TM_ID and its linked forest "
+            "attributes to the tree record."
+        ),
+        "polygon_analysis": (
+            "The raster can be analyzed with polygons in principle, but the raster view does not perform this yet. "
+            "The implementation must transform the drawn polygon into EPSG:5070, mask Band 1 to that geometry, and "
+            "calculate pixel counts, percentages, dominant values, and area inside the polygon."
+        ),
+        "inventory_connection": (
+            "The raster and CSV inventory are currently separate selectable datasets. Connecting them requires a "
+            "spatial join: read each tree coordinate, transform it to EPSG:5070, sample Band 1 at that point, and add "
+            "the sampled TM_ID and its linked forest-profile attributes to the corresponding tree row."
+        ),
+        "attribute_meaning": format_raster_context(layer),
+        "forest_types": format_raster_context(layer),
+        "general_chat": (
+            "Canopy is an AI knowledge base for forestry, tree inventory, raster, and spatial datasets. Respond "
+            "naturally to casual conversation and do not force dataset facts into the response."
+        ),
+    }
+    focus_context = focus_contexts.get(intent, format_raster_context(layer))
+
+    prompt = f"""
+You are Canopy, an AI knowledge base for forestry, tree inventory, and spatial datasets.
+The question has already been interpreted as: {intent}
+
+Use only this relevant, verified context:
+{focus_context}
+
+USER QUESTION
+{question}
+
+Answer the exact question directly in 2-5 clear sentences. Do not discuss unrelated capabilities.
+Do not restate the question or begin with "The question asks," "To clarify," or "It is unclear."
+Never invent raster meanings, class names, units, or implemented features.
+"""
+    if use_model:
+        answer = safe_ollama_chat(model_name, prompt, options={"temperature": 0.15})
+        if answer:
+            return answer
+
+    if intent == "polygon_analysis":
+        return (
+            "The raster is already displayed on the map, but analysis inside a drawn polygon is not implemented yet. "
+            "The next step is to mask Band 1 with the polygon and calculate value counts, percentages, and dominant values inside it."
+        )
+    if intent in {"point_sampling", "inventory_connection"}:
+        return (
+            "Connecting this raster to a tree inventory requires transforming each tree coordinate into EPSG:5070, "
+            "sampling the raster cell at that location, and joining the sampled value back to the tree record. "
+            "That point-sampling workflow is not implemented yet."
+        )
+    if intent == "current_capabilities":
+        if has_attribute_table:
+            return (
+                "Canopy can read and map this GeoTIFF, summarize its pixels, interpret Band 1 as TreeMap `TM_ID` values, "
+                "and use the accompanying attribute table to report forest type and structural attributes. Point "
+                "sampling and polygon statistics are not implemented yet."
+            )
+        return (
+            "Canopy can currently read this GeoTIFF, display its actual Band 1 cells, and summarize its metadata and "
+            "whole-raster values. Point sampling, polygon statistics, and code translation are the next steps."
+        )
+    if intent == "general_chat":
+        return explain_general_chat(question, model_name, False)
+    if intent == "crs":
+        return f"This raster uses `{layer.get('crs', 'an unknown CRS')}`."
+    if bounds and intent == "location":
+        west, south, east, north = bounds
+        return f"The raster extends from approximately ({west:.4f}, {south:.4f}) to ({east:.4f}, {north:.4f}) in geographic coordinates."
+    if data_summary.get("valid_pixels") and intent == "value_summary":
+        return (
+            f"Band 1 contains {data_summary['valid_pixels']:,} valid pixels and "
+            f"{data_summary['unique_values']:,} distinct values, ranging from "
+            f"{data_summary['minimum']:,.0f} to {data_summary['maximum']:,.0f}."
+        )
+    if intent == "attribute_meaning" and product_metadata.get("band_role") == "TM_ID":
+        return (
+            "Band 1 stores a TreeMap `TM_ID`, not a measured environmental unit. Each 30 x 30 meter forest pixel "
+            "links to a modeled FIA plot profile in the accompanying attribute table."
+        )
+    if intent == "forest_types" and data_summary.get("forest_type_summary"):
+        top_types = data_summary["forest_type_summary"][:5]
+        readable = ", ".join(
+            f"{row['Forest type']} ({row['Percent of mapped pixels']:.1f}%)"
+            for row in top_types
+        )
+        return f"The dominant mapped forest types are {readable}."
+    return fallback
+
+
+def make_raster_suggested_questions(layer: Dict[str, Any]) -> List[str]:
+    name = layer.get("name", "this raster")
+    return [
+        f"Summarize {name}",
+        "What CRS does this raster use?",
+        "Where is this raster located?",
+        "What are the raster dimensions?",
+        "What can Canopy do with this raster right now?",
+        "What do the Band 1 pixel values represent?",
+        "What are the dominant forest types in this raster?",
+        "What is needed to sample raster values at tree points?",
+        "Can this raster be used with drawn polygons?",
+        "How would this raster connect to the tree inventory?",
+    ]
+
+
 def get_ollama_content(response: Any) -> str:
     try:
         if isinstance(response, dict):
@@ -104,15 +1308,58 @@ def get_ollama_content(response: Any) -> str:
 
 
 def safe_ollama_chat(model_name: str, prompt: str, options: Optional[Dict[str, Any]] = None) -> str:
+    request_options = dict(options or {})
+    try:
+        force_cpu = bool(st.session_state.get("ollama_force_cpu", False))
+    except Exception:
+        force_cpu = False
+
+    if force_cpu:
+        request_options["num_gpu"] = 0
+
     try:
         response = ollama.chat(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
-            options=options or {},
+            options=request_options,
         )
+        try:
+            st.session_state["ollama_runtime"] = "CPU" if request_options.get("num_gpu") == 0 else "GPU"
+            st.session_state.pop("last_ollama_error", None)
+        except Exception:
+            pass
         return get_ollama_content(response).strip()
-    except Exception:
-        return ""
+    except Exception as first_error:
+        if request_options.get("num_gpu") == 0:
+            try:
+                st.session_state["last_ollama_error"] = str(first_error)
+            except Exception:
+                pass
+            return ""
+
+        cpu_options = dict(request_options)
+        cpu_options["num_gpu"] = 0
+        try:
+            response = ollama.chat(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                options=cpu_options,
+            )
+            try:
+                st.session_state["ollama_force_cpu"] = True
+                st.session_state["ollama_runtime"] = "CPU fallback"
+                st.session_state.pop("last_ollama_error", None)
+            except Exception:
+                pass
+            return get_ollama_content(response).strip()
+        except Exception as cpu_error:
+            try:
+                st.session_state["last_ollama_error"] = (
+                    f"GPU call failed: {first_error}; CPU retry failed: {cpu_error}"
+                )
+            except Exception:
+                pass
+            return ""
 
 
 # -----------------------------
@@ -1351,7 +2598,6 @@ def build_result(
             summary_parts.append("No usable coordinate fields were detected for mapping in this dataset.")
 
         table_df = pd.DataFrame(summary_rows)
-        preview_df = filtered_df.head(int(instructions.get("limit", 1000))) if matching_rows > 0 else None
         verified_summary = " ".join(summary_parts)
 
     else:
@@ -1810,13 +3056,18 @@ def init_chat_state(csv_name: str) -> Tuple[str, Dict[str, Any], str]:
     active_key = f"active_chat::{csv_name}"
 
     if chats_key not in st.session_state:
-        first_id = str(uuid4())
-        st.session_state[chats_key] = {
-            first_id: {
-                "title": "New chat",
-                "messages": [],
+        st.session_state[chats_key] = load_saved_chats(csv_name)
+        if not st.session_state[chats_key]:
+            first_id = str(uuid4())
+            st.session_state[chats_key] = {
+                first_id: {
+                    "title": "New chat",
+                    "messages": [],
+                }
             }
-        }
+            save_chat(csv_name, first_id, st.session_state[chats_key][first_id])
+        else:
+            first_id = next(iter(st.session_state[chats_key]))
         st.session_state[active_key] = first_id
 
     if active_key not in st.session_state or st.session_state[active_key] not in st.session_state[chats_key]:
@@ -1837,20 +3088,37 @@ def create_new_chat(csv_name: str) -> None:
         "messages": [],
     }
     st.session_state[active_key] = new_id
+    save_chat(csv_name, new_id, st.session_state[chats_key][new_id])
 
 
 def render_suggested_question_buttons(suggestions: List[str], key_prefix: str) -> Optional[str]:
     if not suggestions:
         return None
 
+    visible_suggestions = suggestions[:4]
+    more_suggestions = suggestions[4:8]
+    show_more_key = f"{key_prefix}::show_more"
+
+    if show_more_key not in st.session_state:
+        st.session_state[show_more_key] = False
+
+    if st.session_state[show_more_key]:
+        visible_suggestions = visible_suggestions + more_suggestions
+
     st.caption("Suggested questions")
     selected_question = None
     columns = st.columns(2)
 
-    for index, suggestion in enumerate(suggestions):
+    for index, suggestion in enumerate(visible_suggestions):
         with columns[index % 2]:
             if st.button(suggestion, key=f"{key_prefix}::{index}", width="stretch"):
                 selected_question = suggestion
+
+    if more_suggestions:
+        toggle_label = "Show fewer questions ^" if st.session_state[show_more_key] else "More suggested questions v"
+        if st.button(toggle_label, key=f"{key_prefix}::toggle_more", width="stretch"):
+            st.session_state[show_more_key] = not st.session_state[show_more_key]
+            st.rerun()
 
     return selected_question
 
@@ -1880,7 +3148,31 @@ def render_assistant_results(
         result_roles = result["roles"]
         coordinate_kind = result.get("coordinate_kind", "none")
 
-        st.write(explanation)
+        extras_key = f"show-extras::{csv_name}::{active_chat_id}::{message_index}::{result_index}"
+        if extras_key not in st.session_state:
+            st.session_state[extras_key] = False
+
+        answer_col, menu_col = st.columns([0.94, 0.06], vertical_alignment="center")
+
+        with answer_col:
+            st.write(explanation)
+
+        with menu_col:
+            menu_key = f"extras-menu::{csv_name}::{active_chat_id}::{message_index}::{result_index}"
+            checkbox_key = f"extras-checkbox::{csv_name}::{active_chat_id}::{message_index}::{result_index}"
+
+            if hasattr(st, "popover"):
+                with st.popover("...", help="Response options", width="stretch", key=menu_key):
+                    st.session_state[extras_key] = st.checkbox(
+                        "Show data result and developer details",
+                        value=st.session_state[extras_key],
+                        key=checkbox_key,
+                    )
+            elif st.button("...", key=menu_key, help="Show or hide data and developer details"):
+                st.session_state[extras_key] = not st.session_state[extras_key]
+                st.rerun()
+
+        show_extras = st.session_state[extras_key]
 
         if payload.get("intent") == "species_list" and table_df is not None:
             st.caption(f"Showing all {len(table_df):,} species/common names. Scroll the table or filter it below.")
@@ -1998,34 +3290,44 @@ def render_assistant_results(
                             else:
                                 st.dataframe(selected_df.head(1000), width="stretch")
 
-        with st.expander("Data result", expanded=False):
-            if payload.get("result_available"):
-                label = payload.get("display_count_label", "Matching records")
-                value = payload.get("display_count_value", len(filtered_df))
+        if show_extras:
+            with st.expander("Data result", expanded=False):
+                if payload.get("result_available"):
+                    label = payload.get("display_count_label", "Matching records")
+                    value = payload.get("display_count_value", len(filtered_df))
 
-                st.write(f"{label}: {value:,}")
+                    st.write(f"{label}: {value:,}")
 
-                if payload.get("intent") == "species_list":
-                    st.caption(f"Tree records checked: {len(filtered_df):,}")
-            else:
-                st.write("Matching records: not applicable")
+                    if payload.get("intent") == "species_list":
+                        st.caption(f"Tree records checked: {len(filtered_df):,}")
+                else:
+                    st.write("Matching records: not applicable")
 
-            if payload.get("cache_hit"):
-                st.caption("Reused cached query result.")
+                if payload.get("cache_hit"):
+                    st.caption("Reused cached query result.")
 
-            if table_df is not None and payload.get("intent") != "species_list":
-                st.dataframe(table_df, width="stretch")
+                if table_df is not None and payload.get("intent") != "species_list":
+                    st.dataframe(table_df, width="stretch")
 
-            if preview_df is not None:
-                with st.expander("Preview matching rows", expanded=False):
-                    st.dataframe(preview_df, width="stretch")
+                if preview_df is not None:
+                    with st.expander("Preview matching rows", expanded=False):
+                        st.dataframe(preview_df, width="stretch")
 
-        with st.expander("Developer details", expanded=False):
-            st.write("Question interpretation")
-            st.json(instructions)
-            st.write("Detected dataset roles")
-            st.json(result_roles)
-            st.write(f"Cache hit: {payload.get('cache_hit', False)}")
+            with st.expander("Developer details", expanded=False):
+                st.write("Question interpretation")
+                st.json(instructions)
+                st.write("Detected dataset roles")
+                st.json(result_roles)
+                st.write(f"Cache hit: {payload.get('cache_hit', False)}")
+                st.write(f"Data backend: {result.get('data_backend', 'pandas')}")
+                if result.get("sql_query"):
+                    st.write("Executed SQL query")
+                    st.code(result["sql_query"], language="sql")
+                    st.write("SQL parameters")
+                    st.json(result.get("sql_parameters", []))
+                    st.caption("The question interpretation above is JSON; the command above is the SQL SQLite actually executed.")
+                else:
+                    st.caption("No SQL command was executed for this response.")
 
 
 # -----------------------------
@@ -2048,14 +3350,41 @@ if st.session_state.get("app_state_version") != APP_STATE_VERSION:
 st.title(APP_NAME)
 st.write("Ask questions across forestry, tree inventory, and spatial datasets. The app answers from the selected data and maps results when coordinates are usable.")
 
-csv_files = get_tree_csv_files()
+with st.sidebar.popover("Import dataset", width="stretch"):
+    st.caption("Supported: CSV, GeoTIFF, TIFF, ERDAS IMG, GDAL VRT, and JPEG 2000.")
+    uploaded_dataset = st.file_uploader(
+        "Choose a dataset",
+        type=["csv", "tif", "tiff", "img", "vrt", "jp2"],
+        accept_multiple_files=False,
+        help="CSV files are stored in data. Raster files are stored in rasters.",
+    )
+    if st.button("Add dataset", disabled=uploaded_dataset is None, width="stretch"):
+        imported_path, import_error = save_uploaded_dataset(uploaded_dataset)
+        if import_error:
+            st.error(import_error)
+        elif imported_path is not None:
+            imported_kind = "CSV" if imported_path.suffix.lower() == ".csv" else "Raster"
+            st.session_state["dataset_selector"] = f"{imported_path.name} ({imported_kind})"
+            st.success(f"Imported `{imported_path.name}`.")
+            st.rerun()
 
-if not csv_files:
-    st.error("No tree CSV files found. Put your tree CSV file inside the data folder.")
+    st.caption("A VRT may reference other raster files; those referenced files must also be available to Canopy.")
+
+dataset_options = get_dataset_options()
+
+if not dataset_options:
+    st.error("No datasets found. Put CSV files in the data folder or raster files in the data or rasters folder.")
     st.stop()
 
-csv_choice = st.sidebar.selectbox("Dataset", csv_files, format_func=lambda x: x.name)
-df = load_csv(csv_choice)
+dataset_labels = [format_dataset_option(option) for option in dataset_options]
+if st.session_state.get("dataset_selector") not in dataset_labels:
+    st.session_state["dataset_selector"] = dataset_labels[0]
+selected_dataset_label = st.sidebar.selectbox(
+    "Dataset",
+    dataset_labels,
+    key="dataset_selector",
+)
+dataset_kind, dataset_path = dataset_options[dataset_labels.index(selected_dataset_label)]
 
 models = get_installed_ollama_models()
 question_preferred_order = ["qwen2.5:3b", "qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b"]
@@ -2085,10 +3414,237 @@ if "use_model_parse" not in st.session_state:
 if "use_model_explanation" not in st.session_state:
     st.session_state["use_model_explanation"] = True
 
+if "use_sql_backend" not in st.session_state:
+    st.session_state["use_sql_backend"] = True
+
 model_name = st.session_state["question_model"]
 schema_model_name = st.session_state["schema_model"]
 use_model_parse = st.session_state["use_model_parse"]
 use_model_explanation = st.session_state["use_model_explanation"]
+use_sql_backend = st.session_state["use_sql_backend"]
+
+if dataset_kind == "fvs":
+    from fvs_drive_bridge import render_fvs_drive_mode
+
+    render_fvs_drive_mode(globals(), dataset_path)
+    st.stop()
+
+if dataset_kind == "raster":
+    raster_key = f"raster::{dataset_path.name}"
+    chats_key, chats, active_chat_id = init_chat_state(raster_key)
+
+    if st.sidebar.button("New chat", width="stretch"):
+        create_new_chat(raster_key)
+        st.rerun()
+
+    if st.sidebar.button("Clear current chat", width="stretch"):
+        st.session_state[chats_key][active_chat_id]["messages"] = []
+        st.session_state[chats_key][active_chat_id]["title"] = "New chat"
+        save_chat(raster_key, active_chat_id, st.session_state[chats_key][active_chat_id])
+        st.rerun()
+
+    chat_ids = list(st.session_state[chats_key].keys())
+    active_index = chat_ids.index(st.session_state[f"active_chat::{raster_key}"])
+    chat_labels = [st.session_state[chats_key][cid]["title"] for cid in chat_ids]
+
+    selected_chat_label = st.sidebar.selectbox(
+        "Chat history",
+        chat_labels,
+        index=active_index,
+    )
+    selected_chat_id = chat_ids[chat_labels.index(selected_chat_label)]
+
+    if selected_chat_id != st.session_state[f"active_chat::{raster_key}"]:
+        st.session_state[f"active_chat::{raster_key}"] = selected_chat_id
+        st.rerun()
+
+    active_chat_id = st.session_state[f"active_chat::{raster_key}"]
+    messages = st.session_state[chats_key][active_chat_id]["messages"]
+    suggested_prompt_key = f"suggested_prompt::{raster_key}::{active_chat_id}"
+
+    with st.sidebar.expander("Advanced options", expanded=False):
+        with st.form("raster_settings_form"):
+            question_model_choice = st.selectbox(
+                "Question model",
+                models,
+                index=models.index(st.session_state["question_model"]) if st.session_state["question_model"] in models else 0,
+            )
+            explanation_choice = st.checkbox(
+                "Use model for raster answers",
+                value=st.session_state["use_model_explanation"],
+            )
+            settings_submitted = st.form_submit_button("Apply settings")
+
+        if settings_submitted:
+            st.session_state["question_model"] = question_model_choice
+            st.session_state["use_model_explanation"] = explanation_choice
+            st.rerun()
+
+        st.caption(f"Question model: `{st.session_state['question_model']}`")
+        if st.session_state.get("ollama_runtime"):
+            st.caption(f"Model runtime: `{st.session_state['ollama_runtime']}`")
+        if st.session_state.get("last_ollama_error"):
+            st.warning("The local model is unavailable; Canopy is using a fallback answer.")
+        st.caption("Data backend: raster metadata")
+
+    raster_layer = get_raster_layer_for_path(dataset_path)
+    if raster_layer.get("rasterio_available"):
+        raster_layer["data_summary"] = read_raster_data_summary(
+            str(dataset_path.resolve()),
+            dataset_path.stat().st_mtime,
+            get_raster_companion_signature(dataset_path),
+        )
+
+    st.subheader("Raster overview")
+    if raster_layer.get("rasterio_available"):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Driver", raster_layer.get("driver", "Unknown"))
+        c2.metric("Bands", raster_layer.get("bands", "Unknown"))
+        c3.metric("Width", f"{raster_layer.get('width', 0):,}")
+        c4.metric("Height", f"{raster_layer.get('height', 0):,}")
+        st.info(summarize_raster_layer(raster_layer))
+    else:
+        st.warning(summarize_raster_layer(raster_layer))
+
+    raster_table = pd.DataFrame([{
+        "Name": raster_layer.get("name"),
+        "Folder": raster_layer.get("folder"),
+        "Size MB": raster_layer.get("size_mb"),
+        "Driver": raster_layer.get("driver"),
+        "CRS": raster_layer.get("crs"),
+        "Width": raster_layer.get("width"),
+        "Height": raster_layer.get("height"),
+        "Bands": raster_layer.get("bands"),
+        "Bounds": raster_layer.get("bounds"),
+        "Geographic bounds": raster_layer.get("bounds_wgs84"),
+    }])
+    st.dataframe(raster_table, width="stretch", hide_index=True)
+
+    data_summary = raster_layer.get("data_summary", {})
+    if data_summary.get("valid_pixels"):
+        product_metadata = data_summary.get("product_metadata", {})
+        value_label = "TM_ID" if product_metadata.get("band_role") == "TM_ID" else "value"
+        st.write("Raster value summary")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Valid pixels", f"{data_summary['valid_pixels']:,}")
+        s2.metric("Distinct values", f"{data_summary['unique_values']:,}")
+        s3.metric(f"Minimum {value_label}", f"{data_summary['minimum']:,.0f}")
+        s4.metric(f"Maximum {value_label}", f"{data_summary['maximum']:,.0f}")
+        with st.expander("Most common mapped plot profiles", expanded=False):
+            st.dataframe(pd.DataFrame(data_summary["top_values"]), width="stretch", hide_index=True)
+            if data_summary.get("attribute_rows"):
+                st.caption(
+                    "Each pixel value is a TreeMap TM_ID. The accompanying raster attribute table supplies the "
+                    "linked forest type and structural attributes shown here."
+                )
+            else:
+                st.caption("These are numeric codes; no accompanying attribute table was found to interpret them.")
+
+        if data_summary.get("forest_type_summary"):
+            with st.expander("Mapped forest types", expanded=False):
+                st.dataframe(
+                    pd.DataFrame(data_summary["forest_type_summary"]),
+                    width="stretch",
+                    height=360,
+                    hide_index=True,
+                )
+                st.caption(
+                    "Percentages are weighted by the number of 30 x 30 meter raster pixels assigned to each forest type."
+                )
+
+        if data_summary.get("attribute_rows"):
+            with st.expander("Raster attribute table", expanded=False):
+                st.caption(
+                    f"{data_summary['attribute_rows']:,} modeled plot profiles from "
+                    f"`{Path(data_summary['companion_files']['attribute_table']).name}`."
+                )
+                st.dataframe(
+                    data_summary["attribute_table"],
+                    width="stretch",
+                    height=420,
+                    hide_index=True,
+                )
+
+        if product_metadata:
+            with st.expander("Raster product documentation", expanded=False):
+                if product_metadata.get("title"):
+                    st.write(product_metadata["title"])
+                if product_metadata.get("value_definition"):
+                    st.write(f"**Pixel value:** {product_metadata['value_definition']}")
+                if product_metadata.get("abstract"):
+                    st.write(product_metadata["abstract"])
+
+    raster_footprint_map = make_raster_footprint_map([raster_layer])
+    if raster_footprint_map is not None:
+        st.write("Raster data preview")
+        if data_summary.get("product_metadata", {}).get("band_role") == "TM_ID":
+            st.caption(
+                "The colored layer shows the spatial pattern of TM_ID values. Colors distinguish identifier values "
+                "for previewing the raster; they do not represent an ordered forest measurement."
+            )
+        else:
+            st.caption("The colored layer shows actual Band 1 pixel values using a display stretch; it is not a class legend.")
+        st_folium(
+            raster_footprint_map,
+            width=1000,
+            height=500,
+            key=f"selected-raster-footprint::{dataset_path.name}",
+        )
+
+    for message in messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+
+    suggested_prompt = st.session_state.pop(suggested_prompt_key, None)
+    prompt = st.chat_input("Ask about this raster dataset...")
+    active_prompt = suggested_prompt or prompt
+
+    if active_prompt:
+        cleaned_prompt = normalize_prompt(active_prompt)
+        messages.append({
+            "role": "user",
+            "content": cleaned_prompt,
+        })
+
+        current_title = st.session_state[chats_key][active_chat_id]["title"]
+        if current_title.startswith("New chat") or current_title.startswith("Chat "):
+            title = cleaned_prompt
+            if len(title) > 40:
+                title = title[:37] + "..."
+            st.session_state[chats_key][active_chat_id]["title"] = title
+
+        with st.chat_message("user"):
+            st.write(cleaned_prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                answer = answer_raster_question(
+                    cleaned_prompt,
+                    raster_layer,
+                    model_name,
+                    use_model_explanation,
+                )
+            st.write(answer)
+
+        messages.append({
+            "role": "assistant",
+            "content": answer,
+        })
+        save_chat(raster_key, active_chat_id, st.session_state[chats_key][active_chat_id])
+
+    next_suggested_prompt = render_suggested_question_buttons(
+        make_raster_suggested_questions(raster_layer),
+        f"suggested::{raster_key}::{active_chat_id}",
+    )
+
+    if next_suggested_prompt:
+        st.session_state[suggested_prompt_key] = next_suggested_prompt
+        st.rerun()
+
+    st.stop()
+
+csv_choice = dataset_path
+df = load_csv(csv_choice)
 
 base_schema = infer_schema_rules_only(csv_choice.name, df)
 schema_key = f"schema::{csv_choice.name}"
@@ -2130,17 +3686,19 @@ if st.sidebar.button("New chat", width="stretch"):
 if st.sidebar.button("Clear current chat", width="stretch"):
     st.session_state[chats_key][active_chat_id]["messages"] = []
     st.session_state[chats_key][active_chat_id]["title"] = "New chat"
+    save_chat(csv_choice.name, active_chat_id, st.session_state[chats_key][active_chat_id])
     st.rerun()
 
 chat_ids = list(st.session_state[chats_key].keys())
 active_index = chat_ids.index(st.session_state[f"active_chat::{csv_choice.name}"])
+chat_labels = [st.session_state[chats_key][cid]["title"] for cid in chat_ids]
 
-selected_chat_id = st.sidebar.selectbox(
+selected_chat_label = st.sidebar.selectbox(
     "Chat history",
-    chat_ids,
+    chat_labels,
     index=active_index,
-    format_func=lambda cid: st.session_state[chats_key][cid]["title"],
 )
+selected_chat_id = chat_ids[chat_labels.index(selected_chat_label)]
 
 if selected_chat_id != st.session_state[f"active_chat::{csv_choice.name}"]:
     st.session_state[f"active_chat::{csv_choice.name}"] = selected_chat_id
@@ -2220,6 +3778,12 @@ with st.sidebar.expander("Advanced options", expanded=False):
             value=st.session_state["use_model_explanation"],
         )
 
+        sql_backend_choice = st.checkbox(
+            "Use SQL backend for filtering",
+            value=st.session_state["use_sql_backend"],
+            help="Syncs the selected CSV into a local SQLite database and uses SQL for deterministic filtering. Turn off to use the pandas fallback.",
+        )
+
         st.markdown("### Dataset setup")
 
         schema_model_choice = st.selectbox(
@@ -2235,10 +3799,16 @@ with st.sidebar.expander("Advanced options", expanded=False):
         st.session_state["schema_model"] = schema_model_choice
         st.session_state["use_model_parse"] = parse_choice
         st.session_state["use_model_explanation"] = explanation_choice
+        st.session_state["use_sql_backend"] = sql_backend_choice
         st.rerun()
 
     st.caption(f"Question model: `{st.session_state['question_model']}`")
     st.caption(f"Schema model: `{st.session_state['schema_model']}`")
+    if st.session_state.get("ollama_runtime"):
+        st.caption(f"Model runtime: `{st.session_state['ollama_runtime']}`")
+    if st.session_state.get("last_ollama_error"):
+        st.warning("The local model is unavailable; Canopy is using deterministic interpretation or fallback text.")
+    st.caption(f"Data backend: `{'SQLite' if st.session_state['use_sql_backend'] else 'pandas'}`")
 
     st.markdown("### Mapping")
 
@@ -2336,6 +3906,37 @@ if coordinate_note:
 with st.expander("Preview data"):
     st.dataframe(df.head(25), width="stretch")
 
+if use_sql_backend:
+    selected_sql_table = sync_dataframe_to_sqlite(csv_choice.name, df)
+    with st.expander("SQLite database preview", expanded=False):
+        database_size_mb = SQLITE_DB_PATH.stat().st_size / (1024 * 1024) if SQLITE_DB_PATH.exists() else 0
+        st.caption(
+            f"Database: `{SQLITE_DB_PATH}` | Size: {database_size_mb:,.2f} MB | "
+            f"Selected table: `{selected_sql_table}`"
+        )
+        tables_tab, data_tab, columns_tab = st.tabs(["Tables", "Selected data", "Columns"])
+
+        with tables_tab:
+            st.dataframe(get_sqlite_database_overview(), width="stretch", hide_index=True)
+
+        with data_tab:
+            st.code(
+                f"SELECT * FROM {quote_sql_identifier(selected_sql_table)} LIMIT 25",
+                language="sql",
+            )
+            st.dataframe(
+                preview_sqlite_table(selected_sql_table, 25),
+                width="stretch",
+                hide_index=True,
+            )
+
+        with columns_tab:
+            st.dataframe(
+                get_sqlite_table_columns(selected_sql_table),
+                width="stretch",
+                hide_index=True,
+            )
+
 
 def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
     questions = split_questions(query_text)
@@ -2371,12 +3972,38 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
             question,
         )
 
-        filtered_df, filters, warnings, cache_hit, query_cache_key = get_or_run_filtered_query(
-            csv_choice.name,
-            df,
-            schema,
-            instructions,
-        )
+        if use_sql_backend:
+            try:
+                filtered_df, filters, warnings, sql_text, sql_params = run_filtered_query_sql(
+                    csv_choice.name,
+                    df,
+                    schema,
+                    instructions,
+                )
+                cache_hit = False
+                query_cache_key = f"sql::{sql_text}"
+                data_backend = "SQLite"
+            except Exception as exc:
+                filtered_df, filters, warnings, cache_hit, query_cache_key = get_or_run_filtered_query(
+                    csv_choice.name,
+                    df,
+                    schema,
+                    instructions,
+                )
+                warnings.append(f"SQLite query failed, so Canopy used the pandas fallback for this answer: {exc}")
+                data_backend = "pandas fallback"
+                sql_text = None
+                sql_params = []
+        else:
+            filtered_df, filters, warnings, cache_hit, query_cache_key = get_or_run_filtered_query(
+                csv_choice.name,
+                df,
+                schema,
+                instructions,
+            )
+            data_backend = "pandas"
+            sql_text = None
+            sql_params = []
 
         if instructions.get("make_map"):
             result_map_status = get_map_status(
@@ -2434,6 +4061,9 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
             "roles": dict(roles),
             "coordinate_kind": schema.get("coordinate_kind", "none"),
             "query_cache_key": query_cache_key,
+            "data_backend": data_backend,
+            "sql_query": sql_text,
+            "sql_parameters": sql_params,
         })
 
     return computed_results
@@ -2477,6 +4107,7 @@ if not refine_running and pending_schema_question_key in st.session_state:
         "role": "assistant",
         "results": results,
     })
+    save_chat(csv_choice.name, active_chat_id, st.session_state[chats_key][active_chat_id])
 
 suggested_prompt = st.session_state.pop(suggested_prompt_key, None)
 prompt = st.chat_input("Ask about your forestry or spatial data...")
@@ -2513,6 +4144,8 @@ if active_prompt:
         with st.chat_message("assistant"):
             st.write(queued_message)
 
+        save_chat(csv_choice.name, active_chat_id, st.session_state[chats_key][active_chat_id])
+
     else:
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
@@ -2531,6 +4164,7 @@ if active_prompt:
             "role": "assistant",
             "results": results,
         })
+        save_chat(csv_choice.name, active_chat_id, st.session_state[chats_key][active_chat_id])
 
 next_suggested_prompt = render_suggested_question_buttons(
     make_suggested_questions(df, schema, coord_rows),

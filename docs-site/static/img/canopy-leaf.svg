@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">Canopy leaf</title>
+  <path d="M53 7C31 8 13 19 10 39c-2 10 4 17 13 17 19 0 30-22 30-49Z" fill="#39784b"/>
+  <path d="M13 53c10-14 20-24 34-36M25 39c0-7 1-12 3-17M31 32c6-1 11-1 15 0" fill="none" stroke="#143d29" stroke-width="2.3" stroke-linecap="round"/>
+</svg>
