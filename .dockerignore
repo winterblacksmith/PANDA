@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.py[cod]
+.DS_Store
+.pytest_cache
+.streamlit
+storage/*
+ollama_models
+tools
+docs-site/node_modules
+docs-site/build

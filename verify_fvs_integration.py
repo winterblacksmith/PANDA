@@ -1,4 +1,4 @@
-"""Executable proof for Canopy's FVS, shapefile, raster, SQL, and chat joins."""
+"""Executable proof for PANDA's FVS, shapefile, raster, SQL, and chat joins."""
 
 from pathlib import Path
 import pickle
@@ -29,7 +29,7 @@ def check(condition: bool, message: str) -> None:
     print(f"[PASS] {message}")
 
 
-print("CANOPY FVS + TREEMAP INTEGRATION PROOF")
+print("PANDA FVS + TREEMAP INTEGRATION PROOF")
 print("=" * 72)
 frame = pd.read_csv(CSV)
 check(len(frame) == 20_069, "FVS CSV has 20,069 stand rows")

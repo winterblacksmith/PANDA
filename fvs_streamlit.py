@@ -1,4 +1,4 @@
-"""Streamlit presentation layer for Canopy's FVS integration."""
+"""Streamlit presentation layer for PANDA's FVS integration."""
 
 from __future__ import annotations
 
@@ -47,7 +47,8 @@ def _explain(
     if result_df.empty or not use_model:
         return verified_summary
     prompt = f"""
-You are Canopy, a local forestry data assistant. Use only the verified facts below.
+You are PANDA (PERSEUS AI for Natural Language Data Analysis), a forestry data assistant.
+Use only the verified facts below.
 Question: {question}
 Applied filters: {format_fvs_filters(spec)}
 Verified result: {verified_summary}

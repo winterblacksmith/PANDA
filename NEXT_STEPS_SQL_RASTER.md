@@ -1,4 +1,4 @@
-# Canopy SQL and Raster Roadmap
+# PANDA SQL and Raster Roadmap
 
 ## What has started
 
@@ -11,7 +11,7 @@
 
 The current app now defaults to a local SQLite backend for filtering.
 Advanced options still allow switching back to pandas as a fallback.
-When SQL is enabled, Canopy syncs the selected CSV into SQLite and runs deterministic filters through SQL.
+When SQL is enabled, PANDA syncs the selected CSV into SQLite and runs deterministic filters through SQL.
 
 This is a stepping stone toward PostgreSQL/PostGIS:
 
@@ -33,7 +33,7 @@ Supported discovery extensions:
 - `.vrt`
 - `.jp2`
 
-Raster metadata is basic until Rasterio/GDAL is installed. Once Rasterio is available, Canopy can inspect CRS, bounds, dimensions, bands, and driver information.
+Raster metadata is basic until Rasterio/GDAL is installed. Once Rasterio is available, PANDA can inspect CRS, bounds, dimensions, bands, and driver information.
 
 Recommended raster features:
 

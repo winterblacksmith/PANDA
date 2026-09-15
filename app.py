@@ -1,5 +1,6 @@
 from pathlib import Path
 import importlib
+import os
 
 # Streamlit reruns in the same interpreter. Refresh directory caches when new
 # project modules are added, including on external drives with coarse mtimes.
@@ -36,12 +37,13 @@ except Exception:
 
 DATA_DIR = Path("data")
 RASTER_DIR = Path("rasters")
-STORAGE_DIR = Path("storage")
+STORAGE_DIR = Path(os.environ.get("PANDA_STORAGE_DIR", "storage"))
 SQLITE_DB_PATH = STORAGE_DIR / "canopy.sqlite"
 APP_STATE_VERSION = "stable_chat_tree_ai_2026_06_04_v1"
-APP_NAME = "Canopy"
+APP_NAME = "PANDA"
 APP_DESCRIPTION = (
-    "an AI knowledge base for forestry, tree inventory, and spatial datasets. "
+    "PERSEUS AI for Natural Language Data Analysis: an AI knowledge base for forestry, "
+    "tree inventory, and spatial datasets. "
     "It can summarize existing datasets, answer natural-language questions, filter records, "
     "and map usable location data."
 )
@@ -459,6 +461,7 @@ def save_uploaded_dataset(uploaded_file: Any) -> Tuple[Optional[Path], Optional[
 
 
 def get_installed_ollama_models() -> List[str]:
+    configured_model = os.environ.get("PANDA_OLLAMA_MODEL", "qwen2.5:3b")
     try:
         response = ollama.list()
         raw_models = response.get("models", []) if isinstance(response, dict) else getattr(response, "models", [])
@@ -472,9 +475,9 @@ def get_installed_ollama_models() -> List[str]:
             if name:
                 names.append(name)
 
-        return sorted(set(names)) if names else ["qwen2.5:3b", "qwen3.5:9b", "gpt-oss:20b"]
+        return sorted(set(names)) if names else [configured_model]
     except Exception:
-        return ["qwen2.5:3b", "qwen3.5:9b", "gpt-oss:20b"]
+        return [configured_model]
 
 
 @st.cache_data
@@ -483,7 +486,7 @@ def load_csv(path: Path) -> pd.DataFrame:
 
 
 def ensure_storage_dirs() -> None:
-    STORAGE_DIR.mkdir(exist_ok=True)
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     RASTER_DIR.mkdir(exist_ok=True)
 
 
@@ -1373,7 +1376,7 @@ def interpret_raster_question(question: str, model_name: str, use_model: bool) -
 
     if use_model:
         prompt = f"""
-Classify the user's question about Canopy or its selected raster dataset.
+Classify the user's question about PANDA or its selected raster dataset.
 Return JSON only in this exact shape: {{"intent": "one_label"}}
 
 Allowed labels:
@@ -1382,7 +1385,7 @@ Allowed labels:
 - location: asks where the raster is, its coverage, bounds, or extent
 - dimensions: asks about width, height, bands, file size, or resolution
 - value_summary: asks about pixels, values, statistics, minimum, maximum, mean, median, or distinct values
-- current_capabilities: asks what Canopy can currently do with the raster
+- current_capabilities: asks what PANDA can currently do with the raster
 - point_sampling: asks what is needed to sample raster values at points
 - polygon_analysis: asks about drawn polygons, zonal analysis, or values inside an area
 - inventory_connection: asks how the raster connects or joins to a tree inventory or CSV
@@ -1414,7 +1417,7 @@ User question: {question}
         return "forest_types"
     if any(term in lowered for term in ["tm_id", "plot id", "pixel code", "band 1 represent", "values represent"]):
         return "attribute_meaning"
-    if "canopy" in lowered and any(term in lowered for term in ["do", "support", "right now"]):
+    if any(name in lowered for name in ["panda", "canopy"]) and any(term in lowered for term in ["do", "support", "right now"]):
         return "current_capabilities"
     if "crs" in lowered or "projection" in lowered:
         return "crs"
@@ -1438,7 +1441,7 @@ def answer_raster_question(question: str, layer: Dict[str, Any], model_name: str
     intent = interpret_raster_question(question, model_name, use_model)
     has_attribute_table = bool(data_summary.get("attribute_rows"))
     attribute_capability = (
-        "The accompanying raster attribute table is available, so Canopy can translate TM_ID pixel values into "
+        "The accompanying raster attribute table is available, so PANDA can translate TM_ID pixel values into "
         "forest type, live basal area, canopy percentage, stand height, live trees per acre, biomass, and carbon attributes."
         if has_attribute_table
         else "No accompanying raster attribute table is available, so numeric codes cannot be translated into named attributes."
@@ -1446,7 +1449,7 @@ def answer_raster_question(question: str, layer: Dict[str, Any], model_name: str
 
     focus_contexts = {
         "current_capabilities": (
-            "Canopy currently reads GeoTIFF metadata, displays the actual Band 1 cells as a color-stretched map "
+            "PANDA currently reads GeoTIFF metadata, displays the actual Band 1 cells as a color-stretched map "
             "layer, calculates whole-raster statistics and common numeric values, and reads an accompanying ArcGIS "
             f"raster attribute table when present. {attribute_capability} It does not yet sample CSV tree points, "
             "calculate statistics inside drawn polygons, or join raster values to inventory rows."
@@ -1470,14 +1473,14 @@ def answer_raster_question(question: str, layer: Dict[str, Any], model_name: str
         "attribute_meaning": format_raster_context(layer),
         "forest_types": format_raster_context(layer),
         "general_chat": (
-            "Canopy is an AI knowledge base for forestry, tree inventory, raster, and spatial datasets. Respond "
+            "PANDA is an AI knowledge base for forestry, tree inventory, raster, and spatial datasets. Respond "
             "naturally to casual conversation and do not force dataset facts into the response."
         ),
     }
     focus_context = focus_contexts.get(intent, format_raster_context(layer))
 
     prompt = f"""
-You are Canopy, an AI knowledge base for forestry, tree inventory, and spatial datasets.
+You are PANDA, an AI knowledge base for forestry, tree inventory, and spatial datasets.
 The question has already been interpreted as: {intent}
 
 Use only this relevant, verified context:
@@ -1509,12 +1512,12 @@ Never invent raster meanings, class names, units, or implemented features.
     if intent == "current_capabilities":
         if has_attribute_table:
             return (
-                "Canopy can read and map this GeoTIFF, summarize its pixels, interpret Band 1 as TreeMap `TM_ID` values, "
+                "PANDA can read and map this GeoTIFF, summarize its pixels, interpret Band 1 as TreeMap `TM_ID` values, "
                 "and use the accompanying attribute table to report forest type and structural attributes. Point "
                 "sampling and polygon statistics are not implemented yet."
             )
         return (
-            "Canopy can currently read this GeoTIFF, display its actual Band 1 cells, and summarize its metadata and "
+            "PANDA can currently read this GeoTIFF, display its actual Band 1 cells, and summarize its metadata and "
             "whole-raster values. Point sampling, polygon statistics, and code translation are the next steps."
         )
     if intent == "general_chat":
@@ -1552,7 +1555,7 @@ def make_raster_suggested_questions(layer: Dict[str, Any]) -> List[str]:
         "What CRS does this raster use?",
         "Where is this raster located?",
         "What are the raster dimensions?",
-        "What can Canopy do with this raster right now?",
+        "What can PANDA do with this raster right now?",
         "What do the Band 1 pixel values represent?",
         "What are the dominant forest types in this raster?",
         "What is needed to sample raster values at tree points?",
@@ -3644,7 +3647,7 @@ with st.sidebar.popover("Import dataset", width="stretch"):
             st.success(f"Imported `{imported_path.name}`.")
             st.rerun()
 
-    st.caption("A VRT may reference other raster files; those referenced files must also be available to Canopy.")
+    st.caption("A VRT may reference other raster files; those referenced files must also be available to PANDA.")
 
 dataset_options = get_dataset_options()
 
@@ -3769,7 +3772,7 @@ if dataset_kind == "raster":
         if st.session_state.get("ollama_runtime"):
             st.caption(f"Model runtime: `{st.session_state['ollama_runtime']}`")
         if st.session_state.get("last_ollama_error"):
-            st.warning("The local model is unavailable; Canopy is using a fallback answer.")
+            st.warning("The local model is unavailable; PANDA is using a fallback answer.")
         st.caption("Data backend: raster metadata")
 
     raster_layer = get_raster_layer_for_path(dataset_path)
@@ -4092,7 +4095,7 @@ with st.sidebar.expander("Advanced options", expanded=False):
     if st.session_state.get("ollama_runtime"):
         st.caption(f"Model runtime: `{st.session_state['ollama_runtime']}`")
     if st.session_state.get("last_ollama_error"):
-        st.warning("The local model is unavailable; Canopy is using deterministic interpretation or fallback text.")
+        st.warning("The local model is unavailable; PANDA is using deterministic interpretation or fallback text.")
     st.caption(f"Data backend: `{'SQLite' if st.session_state['use_sql_backend'] else 'pandas'}`")
 
     st.markdown("### Mapping")
@@ -4275,7 +4278,7 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
                     schema,
                     instructions,
                 )
-                warnings.append(f"SQLite query failed, so Canopy used the pandas fallback for this answer: {exc}")
+                warnings.append(f"SQLite query failed, so PANDA used the pandas fallback for this answer: {exc}")
                 data_backend = "pandas fallback"
                 sql_text = None
                 sql_params = []
