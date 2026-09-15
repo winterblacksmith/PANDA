@@ -9,6 +9,10 @@ def test_geotiff_is_available_and_opens_from_dataset_selector():
     assert not app.exception
     assert not any(expander.label == "Raster layers" for expander in app.expander)
     assert any("FVS stand simulation results" in heading.value for heading in app.subheader)
+    theme_selector = app.sidebar.segmented_control[0]
+    assert theme_selector.label == "Theme"
+    assert theme_selector.value == "Forest"
+    assert list(theme_selector.options) == ["Light", "Dark", "Forest"]
     dataset_selector = app.sidebar.selectbox[0]
     assert any("TreeMap_2022.tif" in str(option) for option in dataset_selector.options)
 

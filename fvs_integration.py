@@ -18,6 +18,7 @@ import folium
 import numpy as np
 import pandas as pd
 from PIL import Image
+from map_basemaps import carto_basemap
 
 
 FVS_NUMERIC_FIELDS = {
@@ -382,7 +383,7 @@ def make_fvs_map(
     features = geojson.get("features", [])
     if not features and not raster_overlay:
         return None
-    map_object = folium.Map(location=[30.25, -82.7], zoom_start=9, tiles="CartoDB positron")
+    map_object = folium.Map(location=[30.25, -82.7], zoom_start=9, **carto_basemap())
     if raster_overlay:
         folium.raster_layers.ImageOverlay(
             image=raster_overlay["data_url"],

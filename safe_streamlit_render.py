@@ -30,11 +30,11 @@ def render_html_table(frame: pd.DataFrame, maximum_rows: int = 200) -> None:
     st.html(
         f"""
         <style>
-          .canopy-table-wrap {{ max-height: 430px; overflow: auto; border: 1px solid #d9e0d8; }}
-          .canopy-table {{ width: 100%; border-collapse: collapse; font: 13px/1.45 system-ui, sans-serif; }}
-          .canopy-table th {{ position: sticky; top: 0; z-index: 1; background: #edf2eb; color: #173f2b; text-align: left; }}
-          .canopy-table th, .canopy-table td {{ padding: 8px 10px; border-bottom: 1px solid #e3e8e2; white-space: nowrap; }}
-          .canopy-table tr:nth-child(even) td {{ background: #fafbf8; }}
+          .canopy-table-wrap {{ max-height: 430px; overflow: auto; color: var(--canopy-text, #173f2b); background: var(--canopy-surface, #fff); border: 1px solid var(--canopy-border, #d9e0d8); border-radius: 9px; }}
+          .canopy-table {{ width: 100%; border-collapse: collapse; color: inherit; font: 13px/1.45 system-ui, sans-serif; }}
+          .canopy-table th {{ position: sticky; top: 0; z-index: 1; background: var(--canopy-surface-strong, #edf2eb); color: var(--canopy-text, #173f2b); text-align: left; }}
+          .canopy-table th, .canopy-table td {{ padding: 8px 10px; border-bottom: 1px solid var(--canopy-border, #e3e8e2); white-space: nowrap; }}
+          .canopy-table tr:nth-child(even) td {{ background: var(--canopy-accent-soft, #fafbf8); }}
         </style>
         <div class="canopy-table-wrap" role="region" aria-label="FVS result table" tabindex="0">
           <table class="canopy-table"><thead><tr>{headings}</tr></thead><tbody>{''.join(rows)}</tbody></table>
@@ -67,14 +67,14 @@ def render_html_bar_chart(frame: pd.DataFrame, category_column: str, value_colum
     st.html(
         f"""
         <style>
-          .canopy-chart-scroll {{ overflow-x: auto; border: 1px solid #d9e0d8; padding: 14px 12px 6px; }}
+          .canopy-chart-scroll {{ overflow-x: auto; color: var(--canopy-text, #173f2b); background: var(--canopy-surface, #fff); border: 1px solid var(--canopy-border, #d9e0d8); border-radius: 9px; padding: 14px 12px 6px; }}
           .canopy-chart {{ display: flex; align-items: end; gap: 5px; height: 365px; min-width: {minimum_width}px; }}
           .canopy-bar-item {{ flex: 1 0 27px; min-width: 27px; height: 100%; display: grid; grid-template-rows: 28px 1fr 54px; }}
-          .canopy-bar-value {{ font: 9px system-ui, sans-serif; color: #5b6b60; writing-mode: vertical-rl; overflow: hidden; opacity: 0; }}
+          .canopy-bar-value {{ font: 9px system-ui, sans-serif; color: var(--canopy-muted, #5b6b60); writing-mode: vertical-rl; overflow: hidden; opacity: 0; }}
           .canopy-bar-item:hover .canopy-bar-value {{ opacity: 1; }}
-          .canopy-bar-track {{ display: flex; align-items: end; min-height: 0; border-bottom: 1px solid #8a998e; }}
-          .canopy-bar {{ width: 100%; min-height: 1px; background: #4f8a5b; }}
-          .canopy-bar-label {{ padding-top: 7px; font: 10px system-ui, sans-serif; color: #33463a; writing-mode: vertical-rl; overflow: hidden; }}
+          .canopy-bar-track {{ display: flex; align-items: end; min-height: 0; border-bottom: 1px solid var(--canopy-muted, #8a998e); }}
+          .canopy-bar {{ width: 100%; min-height: 1px; background: var(--canopy-accent, #4f8a5b); }}
+          .canopy-bar-label {{ padding-top: 7px; font: 10px system-ui, sans-serif; color: var(--canopy-text, #33463a); writing-mode: vertical-rl; overflow: hidden; }}
         </style>
         <div class="canopy-chart-scroll" role="img" aria-label="Sum of acres by {escape(category_column)}">
           <div class="canopy-chart">{''.join(bars)}</div>

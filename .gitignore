@@ -8,6 +8,7 @@ __pycache__/
 storage/*.sqlite
 storage/*.sqlite-*
 storage/*.log
+storage/carto_config.json
 
 ollama_models/
 tools/
