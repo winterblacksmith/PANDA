@@ -28,6 +28,10 @@ from folium.plugins import Draw
 from streamlit_folium import st_folium
 from fvs_integration import discover_fvs_csvs
 from map_basemaps import carto_basemap
+from report_ui import render_report_panel
+from model_connection import render_model_connection
+from conversation import chat_messages, is_data_request
+from chat_shell import apply_chat_shell, chat_composer
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -102,8 +106,8 @@ THEME_PALETTES = {
     },
     "Forest": {
         "color_scheme": "dark",
-        "background": "#071D15",
-        "sidebar": "#0B271D",
+        "background": "#081F18",
+        "sidebar": "#102B22",
         "surface": "rgba(17, 53, 40, 0.90)",
         "surface_strong": "#123B2C",
         "text": "#F2F7F3",
@@ -1581,8 +1585,10 @@ def get_ollama_content(response: Any) -> str:
         return ""
 
 
-def safe_ollama_chat(model_name: str, prompt: str, options: Optional[Dict[str, Any]] = None) -> str:
+def safe_ollama_chat(model_name: str, prompt, options: Optional[Dict[str, Any]] = None) -> str:
     request_options = dict(options or {})
+    request_messages = prompt if isinstance(prompt, list) else [{"role": "user", "content": prompt}]
+    client = ollama.Client(host=os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434"), timeout=180)
     try:
         force_cpu = bool(st.session_state.get("ollama_force_cpu", False))
     except Exception:
@@ -1592,13 +1598,13 @@ def safe_ollama_chat(model_name: str, prompt: str, options: Optional[Dict[str, A
         request_options["num_gpu"] = 0
 
     try:
-        response = ollama.chat(
+        response = client.chat(
             model=model_name,
-            messages=[{"role": "user", "content": prompt}],
+            messages=request_messages,
             options=request_options,
         )
         try:
-            st.session_state["ollama_runtime"] = "CPU" if request_options.get("num_gpu") == 0 else "GPU"
+            st.session_state["ollama_runtime"] = "CPU" if request_options.get("num_gpu") == 0 else "Ollama (automatic hardware selection)"
             st.session_state.pop("last_ollama_error", None)
         except Exception:
             pass
@@ -1614,9 +1620,9 @@ def safe_ollama_chat(model_name: str, prompt: str, options: Optional[Dict[str, A
         cpu_options = dict(request_options)
         cpu_options["num_gpu"] = 0
         try:
-            response = ollama.chat(
+            response = client.chat(
                 model=model_name,
-                messages=[{"role": "user", "content": prompt}],
+                messages=request_messages,
                 options=cpu_options,
             )
             try:
@@ -1759,18 +1765,9 @@ FOLLOWUP_WORDS = [
 
 
 def classify_prompt_type(prompt: str) -> str:
-    q = prompt.lower().strip()
-
-    if not q:
+    if not prompt.strip():
         return "empty"
-
-    if any(term in q for term in DATA_ACTION_WORDS):
-        return "data"
-
-    if any(species in q for species in SPECIES_WORDS):
-        return "data"
-
-    return "general_chat"
+    return "data" if is_data_request(prompt) else "general_chat"
 
 
 def question_is_map_request(question: str) -> bool:
@@ -2943,53 +2940,16 @@ def build_result(
 # AI responses
 # -----------------------------
 
-def explain_general_chat(prompt: str, model_name: str, use_model_explanation: bool) -> str:
-    q = prompt.lower().strip()
-
-    if any(word in q for word in ["hi", "hello", "hey"]) and len(q.split()) <= 4:
-        return f"Hi. What would you like to explore in {APP_NAME}?"
-
-    if "how is your day" in q or "how are you" in q:
-        return "I’m doing well. I’m ready to help with the tree dataset whenever you are."
-
-    if any(phrase in q for phrase in ["who are you", "what are you", "what is this", "what app is this"]):
-        return (
-            f"I'm the chat assistant for {APP_NAME}, {APP_DESCRIPTION} "
-            "I can answer casual questions too, but my main job is helping you work with forestry and tree-related data."
-        )
-
-    if any(phrase in q for phrase in ["what can you do", "what do you do", "help me", "everything i can do", "tell me everything"]):
-        return (
-            "You can ask me to summarize datasets, count trees, list species, filter records by species or traits, "
-            "preview matching rows, and map tree or forestry data when usable coordinates are available."
-        )
-
-    if "favorite pokemon" in q or "favourite pokemon" in q:
-        return "I do not have personal favorites, but Pikachu is probably the classic answer."
-
-    fallback = "I can answer normally too, but I’m mainly set up to help you explore, summarize, filter, and map this tree dataset."
-
-    fallback = f"I can answer normally too, but I am mainly set up to help you explore, summarize, filter, and map forestry and tree datasets in {APP_NAME}."
+def explain_general_chat(prompt: str, model_name: str, use_model_explanation: bool, history=()) -> str:
+    fallback = "AI answers are unavailable right now. Check the Model connection panel in the sidebar for the connection test and setup instructions."
 
     if not use_model_explanation:
-        return fallback
-
-    system_prompt = f"""
-You are a helpful assistant inside {APP_NAME}, {APP_DESCRIPTION}
-The user is casually chatting, not asking for data analysis.
-Answer naturally in 1 to 2 short sentences.
-Do not mention querying the CSV unless the user asks about the dataset.
-Do not describe the app as a programming, binary-tree, heap, or data-structures tool.
-Do not pretend to have personal experiences.
-
-User message:
-{prompt}
-"""
+        return "AI answers are turned off. Enable model answers in the sidebar settings."
 
     text = safe_ollama_chat(
         model_name,
-        system_prompt,
-        options={"temperature": 0.4, "num_predict": 140},
+        chat_messages(prompt, history),
+        options={"temperature": 0.6, "num_predict": 1200, "num_ctx": 8192},
     )
 
     return text if text else fallback
@@ -3379,20 +3339,16 @@ def render_suggested_question_buttons(suggestions: List[str], key_prefix: str) -
     if st.session_state[show_more_key]:
         visible_suggestions = visible_suggestions + more_suggestions
 
-    st.caption("Suggested questions")
     selected_question = None
-    columns = st.columns(2)
-
-    for index, suggestion in enumerate(visible_suggestions):
-        with columns[index % 2]:
+    with st.sidebar.expander("Example questions", expanded=False):
+        for index, suggestion in enumerate(visible_suggestions):
             if st.button(suggestion, key=f"{key_prefix}::{index}", width="stretch"):
                 selected_question = suggestion
-
-    if more_suggestions:
-        toggle_label = "Show fewer questions ^" if st.session_state[show_more_key] else "More suggested questions v"
-        if st.button(toggle_label, key=f"{key_prefix}::toggle_more", width="stretch"):
-            st.session_state[show_more_key] = not st.session_state[show_more_key]
-            st.rerun()
+        if more_suggestions:
+            toggle_label = "Show fewer questions" if st.session_state[show_more_key] else "More questions"
+            if st.button(toggle_label, key=f"{key_prefix}::toggle_more", width="stretch"):
+                st.session_state[show_more_key] = not st.session_state[show_more_key]
+                st.rerun()
 
     return selected_question
 
@@ -3626,8 +3582,8 @@ if st.session_state.get("app_theme") not in THEME_PALETTES:
 
 apply_app_theme(st.session_state["app_theme"])
 
-st.title(APP_NAME)
-st.write("Ask questions across forestry, tree inventory, and spatial datasets. The app answers from the selected data and maps results when coordinates are usable.")
+apply_chat_shell()
+sidebar_chat_actions = st.sidebar.container()
 
 with st.sidebar.popover("Import dataset", width="stretch"):
     st.caption("Supported: CSV, GeoTIFF, TIFF, ERDAS IMG, GDAL VRT, and JPEG 2000.")
@@ -3665,16 +3621,14 @@ selected_dataset_label = st.sidebar.selectbox(
 )
 dataset_kind, dataset_path = dataset_options[dataset_labels.index(selected_dataset_label)]
 
-st.sidebar.segmented_control(
-    "Theme",
-    list(THEME_PALETTES),
-    selection_mode="single",
-    key="app_theme",
-    width="stretch",
-    help="Choose the interface palette used throughout the application.",
-)
+with st.sidebar.expander("Appearance & data", expanded=False):
+    st.segmented_control("Theme", list(THEME_PALETTES), selection_mode="single",
+                         key="app_theme", width="stretch")
+    st.toggle("Show dataset details", value=False, key="show_dataset_details")
 
 models = get_installed_ollama_models()
+with st.sidebar:
+    render_model_connection()
 question_preferred_order = ["qwen2.5:3b", "qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b"]
 schema_preferred_order = ["qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b", "qwen2.5:3b"]
 
@@ -3721,7 +3675,7 @@ if dataset_kind == "raster":
     raster_key = f"raster::{dataset_path.name}"
     chats_key, chats, active_chat_id = init_chat_state(raster_key)
 
-    if st.sidebar.button("New chat", width="stretch"):
+    if sidebar_chat_actions.button("New chat", width="stretch"):
         create_new_chat(raster_key)
         st.rerun()
 
@@ -3783,108 +3737,109 @@ if dataset_kind == "raster":
             get_raster_companion_signature(dataset_path),
         )
 
-    st.subheader("Raster overview")
-    if raster_layer.get("rasterio_available"):
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Driver", raster_layer.get("driver", "Unknown"))
-        c2.metric("Bands", raster_layer.get("bands", "Unknown"))
-        c3.metric("Width", f"{raster_layer.get('width', 0):,}")
-        c4.metric("Height", f"{raster_layer.get('height', 0):,}")
-        st.info(summarize_raster_layer(raster_layer))
-    else:
-        st.warning(summarize_raster_layer(raster_layer))
+    if st.session_state.get("show_dataset_details", False):
+        st.subheader("Raster overview")
+        if raster_layer.get("rasterio_available"):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Driver", raster_layer.get("driver", "Unknown"))
+            c2.metric("Bands", raster_layer.get("bands", "Unknown"))
+            c3.metric("Width", f"{raster_layer.get('width', 0):,}")
+            c4.metric("Height", f"{raster_layer.get('height', 0):,}")
+            st.info(summarize_raster_layer(raster_layer))
+        else:
+            st.warning(summarize_raster_layer(raster_layer))
 
-    raster_table = pd.DataFrame([{
-        "Name": raster_layer.get("name"),
-        "Folder": raster_layer.get("folder"),
-        "Size MB": raster_layer.get("size_mb"),
-        "Driver": raster_layer.get("driver"),
-        "CRS": raster_layer.get("crs"),
-        "Width": raster_layer.get("width"),
-        "Height": raster_layer.get("height"),
-        "Bands": raster_layer.get("bands"),
-        "Bounds": raster_layer.get("bounds"),
-        "Geographic bounds": raster_layer.get("bounds_wgs84"),
-    }])
-    st.dataframe(raster_table, width="stretch", hide_index=True)
+        raster_table = pd.DataFrame([{
+            "Name": raster_layer.get("name"),
+            "Folder": raster_layer.get("folder"),
+            "Size MB": raster_layer.get("size_mb"),
+            "Driver": raster_layer.get("driver"),
+            "CRS": raster_layer.get("crs"),
+            "Width": raster_layer.get("width"),
+            "Height": raster_layer.get("height"),
+            "Bands": raster_layer.get("bands"),
+            "Bounds": raster_layer.get("bounds"),
+            "Geographic bounds": raster_layer.get("bounds_wgs84"),
+        }])
+        st.dataframe(raster_table, width="stretch", hide_index=True)
 
-    data_summary = raster_layer.get("data_summary", {})
-    if data_summary.get("valid_pixels"):
-        product_metadata = data_summary.get("product_metadata", {})
-        value_label = "TM_ID" if product_metadata.get("band_role") == "TM_ID" else "value"
-        st.write("Raster value summary")
-        s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Valid pixels", f"{data_summary['valid_pixels']:,}")
-        s2.metric("Distinct values", f"{data_summary['unique_values']:,}")
-        s3.metric(f"Minimum {value_label}", f"{data_summary['minimum']:,.0f}")
-        s4.metric(f"Maximum {value_label}", f"{data_summary['maximum']:,.0f}")
-        with st.expander("Most common mapped plot profiles", expanded=False):
-            st.dataframe(pd.DataFrame(data_summary["top_values"]), width="stretch", hide_index=True)
+        data_summary = raster_layer.get("data_summary", {})
+        if data_summary.get("valid_pixels"):
+            product_metadata = data_summary.get("product_metadata", {})
+            value_label = "TM_ID" if product_metadata.get("band_role") == "TM_ID" else "value"
+            st.write("Raster value summary")
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Valid pixels", f"{data_summary['valid_pixels']:,}")
+            s2.metric("Distinct values", f"{data_summary['unique_values']:,}")
+            s3.metric(f"Minimum {value_label}", f"{data_summary['minimum']:,.0f}")
+            s4.metric(f"Maximum {value_label}", f"{data_summary['maximum']:,.0f}")
+            with st.expander("Most common mapped plot profiles", expanded=False):
+                st.dataframe(pd.DataFrame(data_summary["top_values"]), width="stretch", hide_index=True)
+                if data_summary.get("attribute_rows"):
+                    st.caption(
+                        "Each pixel value is a TreeMap TM_ID. The accompanying raster attribute table supplies the "
+                        "linked forest type and structural attributes shown here."
+                    )
+                else:
+                    st.caption("These are numeric codes; no accompanying attribute table was found to interpret them.")
+
+            if data_summary.get("forest_type_summary"):
+                with st.expander("Mapped forest types", expanded=False):
+                    st.dataframe(
+                        pd.DataFrame(data_summary["forest_type_summary"]),
+                        width="stretch",
+                        height=360,
+                        hide_index=True,
+                    )
+                    st.caption(
+                        "Percentages are weighted by the number of 30 x 30 meter raster pixels assigned to each forest type."
+                    )
+
             if data_summary.get("attribute_rows"):
+                with st.expander("Raster attribute table", expanded=False):
+                    st.caption(
+                        f"{data_summary['attribute_rows']:,} modeled plot profiles from "
+                        f"`{Path(data_summary['companion_files']['attribute_table']).name}`."
+                    )
+                    st.dataframe(
+                        data_summary["attribute_table"],
+                        width="stretch",
+                        height=420,
+                        hide_index=True,
+                    )
+
+            if product_metadata:
+                with st.expander("Raster product documentation", expanded=False):
+                    if product_metadata.get("title"):
+                        st.write(product_metadata["title"])
+                    if product_metadata.get("value_definition"):
+                        st.write(f"**Pixel value:** {product_metadata['value_definition']}")
+                    if product_metadata.get("abstract"):
+                        st.write(product_metadata["abstract"])
+
+        raster_footprint_map = make_raster_footprint_map([raster_layer])
+        if raster_footprint_map is not None:
+            st.write("Raster data preview")
+            if data_summary.get("product_metadata", {}).get("band_role") == "TM_ID":
                 st.caption(
-                    "Each pixel value is a TreeMap TM_ID. The accompanying raster attribute table supplies the "
-                    "linked forest type and structural attributes shown here."
+                    "The colored layer shows the spatial pattern of TM_ID values. Colors distinguish identifier values "
+                    "for previewing the raster; they do not represent an ordered forest measurement."
                 )
             else:
-                st.caption("These are numeric codes; no accompanying attribute table was found to interpret them.")
-
-        if data_summary.get("forest_type_summary"):
-            with st.expander("Mapped forest types", expanded=False):
-                st.dataframe(
-                    pd.DataFrame(data_summary["forest_type_summary"]),
-                    width="stretch",
-                    height=360,
-                    hide_index=True,
-                )
-                st.caption(
-                    "Percentages are weighted by the number of 30 x 30 meter raster pixels assigned to each forest type."
-                )
-
-        if data_summary.get("attribute_rows"):
-            with st.expander("Raster attribute table", expanded=False):
-                st.caption(
-                    f"{data_summary['attribute_rows']:,} modeled plot profiles from "
-                    f"`{Path(data_summary['companion_files']['attribute_table']).name}`."
-                )
-                st.dataframe(
-                    data_summary["attribute_table"],
-                    width="stretch",
-                    height=420,
-                    hide_index=True,
-                )
-
-        if product_metadata:
-            with st.expander("Raster product documentation", expanded=False):
-                if product_metadata.get("title"):
-                    st.write(product_metadata["title"])
-                if product_metadata.get("value_definition"):
-                    st.write(f"**Pixel value:** {product_metadata['value_definition']}")
-                if product_metadata.get("abstract"):
-                    st.write(product_metadata["abstract"])
-
-    raster_footprint_map = make_raster_footprint_map([raster_layer])
-    if raster_footprint_map is not None:
-        st.write("Raster data preview")
-        if data_summary.get("product_metadata", {}).get("band_role") == "TM_ID":
-            st.caption(
-                "The colored layer shows the spatial pattern of TM_ID values. Colors distinguish identifier values "
-                "for previewing the raster; they do not represent an ordered forest measurement."
+                st.caption("The colored layer shows actual Band 1 pixel values using a display stretch; it is not a class legend.")
+            st_folium(
+                raster_footprint_map,
+                use_container_width=True,
+                height=500,
+                key=f"selected-raster-footprint::{dataset_path.name}",
             )
-        else:
-            st.caption("The colored layer shows actual Band 1 pixel values using a display stretch; it is not a class legend.")
-        st_folium(
-            raster_footprint_map,
-            use_container_width=True,
-            height=500,
-            key=f"selected-raster-footprint::{dataset_path.name}",
-        )
 
     for message in messages:
         with st.chat_message(message["role"]):
             st.write(message["content"])
 
     suggested_prompt = st.session_state.pop(suggested_prompt_key, None)
-    prompt = st.chat_input("Ask about this raster dataset...")
+    prompt = chat_composer(messages, "raster-composer")
     active_prompt = suggested_prompt or prompt
 
     if active_prompt:
@@ -3906,12 +3861,10 @@ if dataset_kind == "raster":
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                answer = answer_raster_question(
-                    cleaned_prompt,
-                    raster_layer,
-                    model_name,
-                    use_model_explanation,
-                )
+                if not is_data_request(cleaned_prompt):
+                    answer = explain_general_chat(cleaned_prompt, model_name, use_model_explanation, messages)
+                else:
+                    answer = answer_raster_question(cleaned_prompt, raster_layer, model_name, use_model_explanation)
             st.write(answer)
 
         messages.append({
@@ -3919,6 +3872,9 @@ if dataset_kind == "raster":
             "content": answer,
         })
         save_chat(raster_key, active_chat_id, st.session_state[chats_key][active_chat_id])
+
+    render_report_panel(messages, raster_key, active_chat_id,
+                        st.session_state[chats_key][active_chat_id]["title"], model_name, safe_ollama_chat)
 
     next_suggested_prompt = render_suggested_question_buttons(
         make_raster_suggested_questions(raster_layer),
@@ -3967,7 +3923,7 @@ selected_map_style = "Standard"
 
 chats_key, chats, active_chat_id = init_chat_state(csv_choice.name)
 
-if st.sidebar.button("New chat", width="stretch"):
+if sidebar_chat_actions.button("New chat", width="stretch"):
     create_new_chat(csv_choice.name)
     st.rerun()
 
@@ -4169,61 +4125,62 @@ with st.sidebar.expander("Advanced options", expanded=False):
         st.session_state["query_cache"] = {}
         st.success("Query cache cleared.")
 
-st.subheader("Dataset overview")
+if st.session_state.get("show_dataset_details", False):
+    st.subheader("Dataset overview")
 
-coordinate_label = get_coordinate_display_label(
-    schema.get("coordinate_kind", "none"),
-    selected_projected_crs,
-)
+    coordinate_label = get_coordinate_display_label(
+        schema.get("coordinate_kind", "none"),
+        selected_projected_crs,
+    )
 
-if coord_rows > 0:
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Rows", f"{len(df):,}")
-    c2.metric("Columns", len(df.columns))
-    c3.metric("Rows with coordinates", f"{coord_rows:,}")
-    c4.metric("Coordinate status", coordinate_label)
-else:
-    c1, c2 = st.columns(2)
-    c1.metric("Rows", f"{len(df):,}")
-    c2.metric("Columns", len(df.columns))
+    if coord_rows > 0:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Rows", f"{len(df):,}")
+        c2.metric("Columns", len(df.columns))
+        c3.metric("Rows with coordinates", f"{coord_rows:,}")
+        c4.metric("Coordinate status", coordinate_label)
+    else:
+        c1, c2 = st.columns(2)
+        c1.metric("Rows", f"{len(df):,}")
+        c2.metric("Columns", len(df.columns))
 
-coordinate_note = get_coordinate_note(schema.get("coordinate_kind", "none"), selected_projected_crs)
-if coordinate_note:
-    st.info(coordinate_note)
+    coordinate_note = get_coordinate_note(schema.get("coordinate_kind", "none"), selected_projected_crs)
+    if coordinate_note:
+        st.info(coordinate_note)
 
-with st.expander("Preview data"):
-    st.dataframe(df.head(25), width="stretch")
+    with st.expander("Preview data"):
+        st.dataframe(df.head(25), width="stretch")
 
-if use_sql_backend:
-    selected_sql_table = sync_dataframe_to_sqlite(csv_choice.name, df)
-    with st.expander("SQLite database preview", expanded=False):
-        database_size_mb = SQLITE_DB_PATH.stat().st_size / (1024 * 1024) if SQLITE_DB_PATH.exists() else 0
-        st.caption(
-            f"Database: `{SQLITE_DB_PATH}` | Size: {database_size_mb:,.2f} MB | "
-            f"Selected table: `{selected_sql_table}`"
-        )
-        tables_tab, data_tab, columns_tab = st.tabs(["Tables", "Selected data", "Columns"])
-
-        with tables_tab:
-            st.dataframe(get_sqlite_database_overview(), width="stretch", hide_index=True)
-
-        with data_tab:
-            st.code(
-                f"SELECT * FROM {quote_sql_identifier(selected_sql_table)} LIMIT 25",
-                language="sql",
+    if use_sql_backend:
+        selected_sql_table = sync_dataframe_to_sqlite(csv_choice.name, df)
+        with st.expander("SQLite database preview", expanded=False):
+            database_size_mb = SQLITE_DB_PATH.stat().st_size / (1024 * 1024) if SQLITE_DB_PATH.exists() else 0
+            st.caption(
+                f"Database: `{SQLITE_DB_PATH}` | Size: {database_size_mb:,.2f} MB | "
+                f"Selected table: `{selected_sql_table}`"
             )
-            st.dataframe(
-                preview_sqlite_table(selected_sql_table, 25),
-                width="stretch",
-                hide_index=True,
-            )
+            tables_tab, data_tab, columns_tab = st.tabs(["Tables", "Selected data", "Columns"])
 
-        with columns_tab:
-            st.dataframe(
-                get_sqlite_table_columns(selected_sql_table),
-                width="stretch",
-                hide_index=True,
-            )
+            with tables_tab:
+                st.dataframe(get_sqlite_database_overview(), width="stretch", hide_index=True)
+
+            with data_tab:
+                st.code(
+                    f"SELECT * FROM {quote_sql_identifier(selected_sql_table)} LIMIT 25",
+                    language="sql",
+                )
+                st.dataframe(
+                    preview_sqlite_table(selected_sql_table, 25),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+            with columns_tab:
+                st.dataframe(
+                    get_sqlite_table_columns(selected_sql_table),
+                    width="stretch",
+                    hide_index=True,
+                )
 
 
 def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
@@ -4240,7 +4197,7 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
         if route == "general_chat":
             computed_results.append({
                 "type": "general_chat",
-                "content": explain_general_chat(question, model_name, use_model_explanation),
+                "content": explain_general_chat(question, model_name, use_model_explanation, messages),
             })
             continue
 
@@ -4398,7 +4355,7 @@ if not refine_running and pending_schema_question_key in st.session_state:
     save_chat(csv_choice.name, active_chat_id, st.session_state[chats_key][active_chat_id])
 
 suggested_prompt = st.session_state.pop(suggested_prompt_key, None)
-prompt = st.chat_input("Ask about your forestry or spatial data...")
+prompt = chat_composer(messages, "csv-composer")
 
 active_prompt = suggested_prompt or prompt
 
@@ -4453,6 +4410,9 @@ if active_prompt:
             "results": results,
         })
         save_chat(csv_choice.name, active_chat_id, st.session_state[chats_key][active_chat_id])
+
+render_report_panel(messages, csv_choice.name, active_chat_id,
+                    st.session_state[chats_key][active_chat_id]["title"], model_name, safe_ollama_chat)
 
 next_suggested_prompt = render_suggested_question_buttons(
     make_suggested_questions(df, schema, coord_rows),

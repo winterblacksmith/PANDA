@@ -20,3 +20,5 @@ docs-site_partial_backup_*/
 
 app.pre_fvs_*.py
 requirements.pre_fvs_*.txt
+output/
+.pytest_cache/

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" role="img" aria-labelledby="panda-title">
+  <title id="panda-title">PANDA — PERSEUS AI for Natural-language Data Analysis</title>
+  <defs><path id="panda-arc" d="M 35 179 A 102 102 0 1 1 205 179"/></defs>
+  <g fill="currentColor">
+    <text font-family="Arial, sans-serif" font-size="12" letter-spacing="1.1"><textPath href="#panda-arc" startOffset="50%" text-anchor="middle">PERSEUS AI for Natural-language Data Analysis</textPath></text>
+    <text x="120" y="216" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="600" letter-spacing="5">PANDA</text>
+  </g>
+  <g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M91 176 C84 140 100 89 124 62 C123 92 145 126 145 161 L142 176 Q117 184 91 176 Z"/>
+    <path d="M95 116 Q107 125 135 131 M89 143 Q113 137 139 153 M96 173 Q118 164 143 163"/>
+    <path d="M143 140 Q146 129 149 122"/>
+    <path d="M149 122 C144 105 154 89 177 85 C177 105 166 119 149 122 Z"/>
+  </g>
+</svg>
