@@ -5,10 +5,14 @@
     <text font-family="Arial, sans-serif" font-size="12" letter-spacing="1.1"><textPath href="#panda-arc" startOffset="50%" text-anchor="middle">PERSEUS AI for Natural-language Data Analysis</textPath></text>
     <text x="120" y="216" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="600" letter-spacing="5">PANDA</text>
   </g>
-  <g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M91 176 C84 140 100 89 124 62 C123 92 145 126 145 161 L142 176 Q117 184 91 176 Z"/>
-    <path d="M95 116 Q107 125 135 131 M89 143 Q113 137 139 153 M96 173 Q118 164 143 163"/>
-    <path d="M143 140 Q146 129 149 122"/>
-    <path d="M149 122 C144 105 154 89 177 85 C177 105 166 119 149 122 Z"/>
+  <g fill="currentColor">
+    <!-- Three flat-ended internodes, separated by clear node gaps. -->
+    <path d="M115 65 Q111 65 111 70 Q115 86 111 103 Q111 107 115 107 H130 Q134 107 134 103 Q130 86 134 70 Q134 65 130 65 Z"/>
+    <path d="M115 113 Q111 113 111 118 Q115 134 111 151 Q111 155 115 155 H130 Q134 155 134 151 Q130 134 134 118 Q134 113 130 113 Z"/>
+    <path d="M115 161 Q111 161 111 165 Q114 177 111 189 Q111 193 115 193 H130 Q134 193 134 189 Q131 177 134 165 Q134 161 130 161 Z"/>
+    <!-- Detached lance-shaped leaves: no stems crossing the stalk. -->
+    <path d="M140 92 Q145 65 173 51 Q166 78 140 92 Z"/>
+    <path d="M102 140 Q78 125 76 98 Q98 114 102 140 Z"/>
+    <path d="M101 150 Q74 153 58 132 Q84 131 101 150 Z"/>
   </g>
 </svg>
