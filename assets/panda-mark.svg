@@ -1,10 +1,15 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" role="img" aria-labelledby="panda-title">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 280" role="img" aria-labelledby="panda-title">
   <title id="panda-title">PANDA — PERSEUS AI for Natural-language Data Analysis</title>
-  <defs><path id="panda-arc" d="M 35 179 A 102 102 0 1 1 205 179"/></defs>
-  <g fill="currentColor">
-    <text font-family="Arial, sans-serif" font-size="12" letter-spacing="1.1"><textPath href="#panda-arc" startOffset="50%" text-anchor="middle">PERSEUS AI for Natural-language Data Analysis</textPath></text>
-    <text x="120" y="216" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="600" letter-spacing="5">PANDA</text>
+  <defs><path id="panda-arc" d="M120 18 A102 102 0 1 1 120 222 A102 102 0 1 1 120 18"/></defs>
+  <style>
+    .panda-orbit {transform-origin:120px 120px;animation:panda-orbit-spin 40s linear infinite;}
+    @keyframes panda-orbit-spin {from {transform:rotate(0deg);} to {transform:rotate(360deg);}}
+    @media (prefers-reduced-motion:reduce) {.panda-orbit {animation:none;}}
+  </style>
+  <g class="panda-orbit" fill="currentColor" aria-hidden="true">
+    <text font-family="Arial, sans-serif" font-size="12" letter-spacing="1.1"><textPath href="#panda-arc" startOffset="0">PERSEUS AI for Natural-language Data Analysis</textPath></text>
   </g>
+  <text fill="currentColor" x="120" y="263" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="600" letter-spacing="5" aria-hidden="true">PANDA</text>
   <g fill="currentColor">
     <!-- Three flat-ended internodes, separated by clear node gaps. -->
     <path d="M115 65 Q111 65 111 70 Q115 86 111 103 Q111 107 115 107 H130 Q134 107 134 103 Q130 86 134 70 Q134 65 130 65 Z"/>
