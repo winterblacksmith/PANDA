@@ -9,7 +9,12 @@ PLACEHOLDER = "Ask a forestry question, or branch out..."
 def apply_chat_shell():
     st.markdown("""<style>
     [data-testid="stMainBlockContainer"] {max-width:1120px;padding-top:2.5rem;padding-bottom:3rem;}
-    [data-testid="stSidebar"] {min-width:260px;max-width:300px;}
+    [data-testid="stSidebar"][aria-expanded="true"] {min-width:260px;max-width:300px;}
+    [data-testid="stSidebar"][aria-expanded="false"] {min-width:0!important;max-width:0!important;width:0!important;}
+    [data-testid="stBottom"] {transition:bottom .55s cubic-bezier(.22,1,.36,1);}
+    [data-testid="stAppViewContainer"]:has(.panda-welcome) [data-testid="stBottom"] {bottom:max(24px,calc(50dvh - 270px))!important;}
+    [data-testid="stBottomBlockContainer"] {max-width:840px;margin-inline:auto;}
+    @media(prefers-reduced-motion:reduce) {[data-testid="stBottom"] {transition:none;}}
     [data-testid="stSidebarUserContent"] {padding:1.5rem 1.25rem;}
     [data-testid="stSidebar"] button p {font-size:14px;}
     .panda-wordmark {font-size:24px;font-weight:650;letter-spacing:5px;margin:0 0 22px 2px;}
@@ -38,15 +43,14 @@ def apply_chat_shell():
 
 
 def chat_composer(messages, key):
-    if not messages and not st.session_state.get("show_dataset_details", False):
-        # A placeholder can be removed immediately after submission, avoiding
-        # a second full app rerun merely to hide the welcome illustration.
-        welcome = st.empty()
-        welcome.markdown('<div class="panda-welcome">' + MARK_PATH.read_text() +
+    submitted = st.session_state.pop(f"{key}-submitted", False)
+    if not messages and not submitted and not st.session_state.get("show_dataset_details", False):
+        st.markdown('<div class="panda-welcome">' + MARK_PATH.read_text() +
                          '<h1>What would you like to explore?</h1></div>', unsafe_allow_html=True)
-        with st.container(key="panda-welcome-composer"):
-            prompt = st.chat_input(PLACEHOLDER, key=key)
-        if prompt:
-            welcome.empty()
-        return prompt
-    return st.chat_input(PLACEHOLDER, key=key)
+
+    def mark_submitted():
+        st.session_state[f"{key}-submitted"] = True
+
+    # Keep the same native bottom input mounted in both states; moving its
+    # container lets CSS animate it without duplicating or losing input focus.
+    return st.chat_input(PLACEHOLDER, key=key, on_submit=mark_submitted)
