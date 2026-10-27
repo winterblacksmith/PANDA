@@ -5,41 +5,40 @@ import Heading from '@theme/Heading';
 import styles from './index.module.css';
 
 const flow = [
-  ['01', 'Question', 'Natural-language forestry question'],
-  ['02', 'Local Qwen', 'Intent and concise explanation'],
-  ['03', 'SQLite', 'Parameterized, reproducible query'],
-  ['04', 'Spatial data', 'CSV, FVS, shapefile and TreeMap'],
-  ['05', 'Evidence', 'Tables, charts and maps'],
+  ['01', 'Ask', 'A natural-language forestry question'],
+  ['02', 'Calculate', 'Parameterized SQLite and spatial operations'],
+  ['03', 'Verify', 'Tables, totals, charts, maps, and query proof'],
+  ['04', 'Explain', 'Qwen turns verified results into clear language'],
+  ['05', 'Remember', 'Conversation history persists in SQLite'],
 ];
 
 export default function Home(): ReactNode {
   return (
-    <Layout title="Canopy documentation" description="Local-first forestry AI knowledge base documentation">
+    <Layout title="PANDA documentation" description="PERSEUS AI for Natural-language Data Analysis">
       <main>
         <section className={styles.hero}>
           <div className={`container ${styles.heroGrid}`}>
             <div>
-              <p className={styles.kicker}>Forestry AI knowledge base</p>
-              <Heading as="h1">Canopy documentation</Heading>
+              <p className={styles.kicker}>PERSEUS AI for Natural-language Data Analysis</p>
+              <Heading as="h1">PANDA documentation</Heading>
               <p className={styles.lede}>
-                Understand how Canopy queries forestry tables, FVS stand results, shapefiles,
-                and TreeMap rasters—locally, with inspectable SQL and saved chat history.
+                Learn how PANDA combines forestry datasets, reproducible SQL, spatial analysis,
+                persistent conversations, and a locally hosted language model.
               </p>
               <div className={styles.actions}>
-                <Link className="button button--primary button--lg" to="/docs/overview">Start with Section 1</Link>
-                <Link className={styles.textLink} to="/docs/data/fvs-treemap">Explore the data →</Link>
+                <Link className="button button--primary button--lg" to="/docs/overview">Start here</Link>
+                <Link className={styles.textLink} to="/docs/handoff/project-handoff">Open the handoff guide →</Link>
               </div>
             </div>
             <figure className={styles.heroFigure}>
-              <img src="img/tcuft-2022.jpg" alt="Cubic foot volume per acre map supplied with the FVS results" />
-              <figcaption>Example forestry output · cubic-foot volume per acre, 2022</figcaption>
+              <img src="img/tcuft-2022.jpg" alt="Cubic-foot volume per acre forestry map" />
+              <figcaption>Example PANDA spatial output · cubic-foot volume per acre</figcaption>
             </figure>
           </div>
         </section>
-
         <section className={styles.flowSection}>
           <div className="container">
-            <Heading as="h2">How Canopy works</Heading>
+            <Heading as="h2">How PANDA works</Heading>
             <div className={styles.flow}>
               {flow.map(([number, title, detail]) => (
                 <div className={styles.flowStep} key={number}>
@@ -49,29 +48,13 @@ export default function Home(): ReactNode {
             </div>
           </div>
         </section>
-
         <section className={styles.guides}>
           <div className="container">
-            <Heading as="h2">Explore the implementation</Heading>
+            <Heading as="h2">Project guides</Heading>
             <div className={styles.guideGrid}>
-              <article>
-                <div className={styles.guideMark}>SQL</div>
-                <Heading as="h3">SQL queries and saved chats</Heading>
-                <p>See exactly how CSV data becomes a local SQLite table and how every query is bound safely.</p>
-                <Link to="/docs/architecture/sql-chat">Read the architecture →</Link>
-              </article>
-              <article>
-                <div className={styles.guideMark}>FVS</div>
-                <Heading as="h3">FVS stand results</Heading>
-                <p>Query 20,069 modeled stands, chart acres by age, and retrieve polygons through unique MU_ID values.</p>
-                <Link to="/docs/data/fvs-treemap">Read the data guide →</Link>
-              </article>
-              <article>
-                <div className={styles.guideMark}>TIF</div>
-                <Heading as="h3">TreeMap raster</Heading>
-                <p>Display actual raster cells and connect FVS selections to TreeMap Band 1 through TM_Value.</p>
-                <Link to="/docs/data/fvs-treemap#the-two-spatial-joins">Understand the join →</Link>
-              </article>
+              <article><div className={styles.guideMark}>SYS</div><Heading as="h3">Architecture</Heading><p>See how the application, SQLite, spatial tools, FastAPI, Ollama, and Qwen fit together.</p><Link to="/docs/architecture/system-overview">Read the architecture →</Link></article>
+              <article><div className={styles.guideMark}>GPU</div><Heading as="h3">Deployment</Heading><p>Operate the Irene inference service and connect it securely to the Railway application.</p><Link to="/docs/deployment/irene-ollama-fastapi">Read the deployment guide →</Link></article>
+              <article><div className={styles.guideMark}>END</div><Heading as="h3">Handoff</Heading><p>Use the final checklist to transfer ownership, validate the system, and plan the next phase.</p><Link to="/docs/handoff/project-handoff">Read the handoff guide →</Link></article>
             </div>
           </div>
         </section>
