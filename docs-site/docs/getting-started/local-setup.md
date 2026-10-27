@@ -1,47 +1,44 @@
 ---
 id: local-setup
-title: Run Canopy locally
-description: Start Ollama, qwen2.5:3b, Streamlit, and the documentation site.
+title: Local development
+description: Run PANDA and its Docusaurus documentation locally.
 ---
 
-# Run Canopy locally
+# Local development
 
-The supported project location is:
+Clone the repository or open the authoritative PANDA working copy. Do not assume a particular external-drive path; confirm the folder that contains `app.py`, `requirements.txt`, and `docs-site/`.
 
-```text
-/Volumes/PERSEUS 4TB/PERSEUS/tree_ai_demo
-```
+## Application
 
-From that directory, the launcher starts the bundled Ollama runtime when necessary and then starts Streamlit:
+When a project virtual environment already exists:
 
 ```bash
-./run_canopy.sh
-```
-
-The preferred local model is `qwen2.5:3b`. Confirm the local runtime and models with:
-
-```bash
-OLLAMA_HOST=127.0.0.1:11434 tools/Ollama.app/Contents/Resources/ollama list
-```
-
-To run Streamlit directly instead of using the launcher:
-
-```bash
-cd "/Volumes/PERSEUS 4TB/PERSEUS/tree_ai_demo"
 source .venv/bin/activate
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
-The former `.venv` was a Windows environment copied onto the Mac, so it had no usable `.venv/bin/python` or `.venv/bin/streamlit`. It was preserved as `.venv_windows_backup_20260805`, and a native environment was created on the PERSEUS drive.
+Using `python -m streamlit` avoids relying on a globally installed `streamlit` shell command.
 
-If a hidden filename beginning with `._` appears on an external drive, it is macOS metadata rather than project data. Canopy now ignores such files automatically.
+## Documentation website
 
-To run the documentation website:
+Docusaurus requires Node.js 20 or newer:
 
 ```bash
 cd docs-site
 npm install
-npm start
+npm run start
 ```
 
-Docusaurus requires Node.js 20 or newer. A production build is generated with `npm run build`.
+The development site normally opens at `http://localhost:3000/PANDA/`. Changes to Markdown files are reflected automatically.
+
+Before publishing:
+
+```bash
+npm run typecheck
+npm run build
+npm run serve
+```
+
+## Online editing
+
+Every documentation page includes an **Edit this page** link. It opens the Markdown file on the `docs/panda-handoff-starter` branch in GitHub, where an authorized maintainer can edit, preview, and commit changes without the PERSEUS drive.
