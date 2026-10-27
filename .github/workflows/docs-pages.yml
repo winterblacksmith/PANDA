@@ -38,6 +38,9 @@ jobs:
       - name: Type-check
         run: npm run typecheck
       - name: Build Docusaurus
+        env:
+          DOCS_URL: https://winterblacksmith.github.io
+          DOCS_BASE_URL: /PANDA/
         run: npm run build
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
