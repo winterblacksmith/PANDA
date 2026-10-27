@@ -3,57 +3,56 @@ import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
-  title: 'Canopy documentation',
-  tagline: 'Query forestry tables and spatial data locally.',
+  title: 'PANDA documentation',
+  tagline: 'PERSEUS AI for Natural-language Data Analysis',
   favicon: 'img/canopy-leaf.svg',
   future: {v4: true},
   url: 'https://winterblacksmith.github.io',
-  baseUrl: '/tree_ai_demo/',
+  baseUrl: '/PANDA/',
   organizationName: 'winterblacksmith',
-  projectName: 'tree_ai_demo',
+  projectName: 'PANDA',
   onBrokenLinks: 'throw',
   i18n: {defaultLocale: 'en', locales: ['en']},
-  presets: [
-    [
-      'classic',
-      {
-        docs: {
-          sidebarPath: './sidebars.ts',
-          editUrl: 'https://github.com/winterblacksmith/tree_ai_demo/edit/main/docs-site/',
-          routeBasePath: 'docs',
-        },
-        blog: false,
-        theme: {customCss: './src/css/custom.css'},
-      } satisfies Preset.Options,
-    ],
-  ],
+  presets: [[
+    'classic',
+    {
+      docs: {
+        sidebarPath: './sidebars.ts',
+        editUrl: 'https://github.com/winterblacksmith/PANDA/edit/docs/panda-handoff-starter/docs-site/',
+        routeBasePath: 'docs',
+      },
+      blog: false,
+      theme: {customCss: './src/css/custom.css'},
+    } satisfies Preset.Options,
+  ]],
   themeConfig: {
     image: 'img/age-species-2022.jpg',
     colorMode: {defaultMode: 'light', disableSwitch: false, respectPrefersColorScheme: true},
     navbar: {
-      title: 'Canopy',
-      logo: {alt: 'Canopy leaf', src: 'img/canopy-leaf.svg'},
+      title: 'PANDA',
+      logo: {alt: 'PANDA forestry AI', src: 'img/canopy-leaf.svg'},
       items: [
-        {type: 'docSidebar', sidebarId: 'canopySidebar', position: 'left', label: 'Docs'},
-        {to: '/docs/data/fvs-treemap', label: 'Data', position: 'left'},
-        {to: '/docs/architecture/sql-chat', label: 'Architecture', position: 'left'},
-        {href: 'https://github.com/winterblacksmith/tree_ai_demo', label: 'GitHub', position: 'right'},
+        {type: 'docSidebar', sidebarId: 'pandaSidebar', position: 'left', label: 'Documentation'},
+        {to: '/docs/architecture/system-overview', label: 'Architecture', position: 'left'},
+        {to: '/docs/handoff/project-handoff', label: 'Handoff', position: 'left'},
+        {href: 'https://github.com/winterblacksmith/PANDA', label: 'GitHub', position: 'right'},
       ],
     },
     footer: {
       style: 'light',
       links: [
         {title: 'Documentation', items: [
-          {label: 'Canopy overview', to: '/docs/overview'},
-          {label: 'FVS and TreeMap', to: '/docs/data/fvs-treemap'},
-          {label: 'SQL and chat persistence', to: '/docs/architecture/sql-chat'},
+          {label: 'PANDA overview', to: '/docs/overview'},
+          {label: 'System architecture', to: '/docs/architecture/system-overview'},
+          {label: 'Testing and troubleshooting', to: '/docs/operations/testing-troubleshooting'},
         ]},
-        {title: 'Project', items: [
-          {label: 'GitHub repository', href: 'https://github.com/winterblacksmith/tree_ai_demo'},
-          {label: 'Run Canopy locally', to: '/docs/getting-started/local-setup'},
+        {title: 'Deployment', items: [
+          {label: 'Irene inference service', to: '/docs/deployment/irene-ollama-fastapi'},
+          {label: 'Railway application', to: '/docs/deployment/railway'},
+          {label: 'GitHub repository', href: 'https://github.com/winterblacksmith/PANDA'},
         ]},
       ],
-      copyright: `Canopy forestry AI knowledge base · ${new Date().getFullYear()}`,
+      copyright: `PANDA · PERSEUS AI for Natural-language Data Analysis · ${new Date().getFullYear()}`,
     },
     prism: {theme: prismThemes.github, darkTheme: prismThemes.dracula},
   } satisfies Preset.ThemeConfig,
