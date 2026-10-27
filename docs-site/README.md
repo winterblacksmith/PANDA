@@ -22,12 +22,25 @@ npm run build
 npm run serve
 ```
 
-## Publish
+## Deploy on Railway
 
-The intended public address is:
+Create a separate Railway service connected to the `docs/panda-handoff-starter` branch, then configure:
 
 ```text
-https://winterblacksmith.github.io/PANDA/
+Root Directory: /docs-site
+Build Command: npm ci && npm run build
+Start Command: npm run serve:railway
+Healthcheck Path: /
 ```
 
-GitHub Pages must be configured to use GitHub Actions before the deployment workflow can publish the site.
+Under Networking, generate a public domain. The preferred name, if Railway reports it available, is:
+
+```text
+https://perseus-panda-docs.up.railway.app
+```
+
+The application does not require database credentials or inference secrets. The documentation is static and should be deployed as a separate service from the PANDA application.
+
+## Optional GitHub Pages deployment
+
+The included workflow can also publish to `https://winterblacksmith.github.io/PANDA/` after GitHub Pages is configured to use GitHub Actions.
