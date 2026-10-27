@@ -1,11 +1,12 @@
 {
-  "name": "docs-site",
-  "version": "0.0.0",
+  "name": "panda-docs",
+  "version": "0.1.0",
   "private": true,
   "scripts": {
     "docusaurus": "docusaurus",
     "start": "docusaurus start",
     "build": "docusaurus build",
+    "serve:railway": "docusaurus serve --host 0.0.0.0 --port $PORT",
     "swizzle": "docusaurus swizzle",
     "deploy": "docusaurus deploy",
     "clear": "docusaurus clear",
@@ -33,18 +34,8 @@
     "typescript": "~6.0.2"
   },
   "browserslist": {
-    "production": [
-      ">0.5%",
-      "not dead",
-      "not op_mini all"
-    ],
-    "development": [
-      "last 3 chrome version",
-      "last 3 firefox version",
-      "last 5 safari version"
-    ]
+    "production": [">0.5%", "not dead", "not op_mini all"],
+    "development": ["last 3 chrome version", "last 3 firefox version", "last 5 safari version"]
   },
-  "engines": {
-    "node": ">=20.0"
-  }
+  "engines": {"node": ">=20.0"}
 }
