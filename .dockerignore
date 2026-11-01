@@ -12,5 +12,6 @@ ollama_models
 tools
 docs-site/node_modules
 docs-site/build
+panda-docs-export
 output
 ._*

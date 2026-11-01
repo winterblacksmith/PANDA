@@ -16,6 +16,8 @@ def apply_chat_shell():
     [data-testid="stBottomBlockContainer"] {max-width:840px;margin-inline:auto;}
     @media(prefers-reduced-motion:reduce) {[data-testid="stBottom"] {transition:none;}}
     [data-testid="stSidebarUserContent"] {padding:1.5rem 1.25rem;}
+    [data-testid="stSidebarUserContent"] > [data-testid="stVerticalBlock"] {min-height:calc(100dvh - 7rem);}
+    .st-key-panda-docs-footer {order:999;margin-top:auto;padding-top:1.5rem;}
     [data-testid="stSidebar"] button p {font-size:14px;}
     .panda-wordmark {font-size:24px;font-weight:650;letter-spacing:5px;margin:0 0 22px 2px;}
     .panda-welcome {text-align:center;padding:clamp(32px,10vh,110px) 0 24px;}
@@ -40,6 +42,8 @@ def apply_chat_shell():
     }
     </style>""", unsafe_allow_html=True)
     st.sidebar.markdown('<div class="panda-wordmark">PANDA</div>', unsafe_allow_html=True)
+    with st.sidebar.container(key="panda-docs-footer"):
+        st.link_button("Documentation & FAQ", "https://panda-docs.up.railway.app/", icon=":material/menu_book:", width="stretch")
 
 
 def chat_composer(messages, key):
