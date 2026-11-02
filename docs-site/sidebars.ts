@@ -17,7 +17,7 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Architecture',
-      items: ['architecture/sql-chat'],
+      items: ['architecture/sql-chat', 'architecture/irene-inference-gateway'],
     },
   ],
 };

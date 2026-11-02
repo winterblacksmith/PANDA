@@ -4,6 +4,7 @@ __pycache__/
 .venv_windows_backup_*/
 .DS_Store
 ._*
+.env.local-llm
 
 storage/*.sqlite
 storage/*.sqlite-*

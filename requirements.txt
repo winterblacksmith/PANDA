@@ -6,6 +6,7 @@ pillow==12.2.0
 folium==0.20.0
 streamlit-folium==0.26.2
 ollama==0.6.2
+httpx>=0.28,<1
 streamlit-autorefresh==1.0.1
 pyproj==3.7.1
 rasterio==1.4.4

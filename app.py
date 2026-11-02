@@ -20,7 +20,6 @@ from uuid import uuid4
 
 import folium
 import numpy as np
-import ollama
 import pandas as pd
 import streamlit as st
 from PIL import Image
@@ -30,6 +29,7 @@ from fvs_integration import discover_fvs_csvs
 from map_basemaps import carto_basemap
 from report_ui import render_report_panel
 from model_connection import render_model_connection
+from llm_client import chat as llm_chat, list_models as list_llm_models, using_gateway
 from conversation import chat_messages, is_data_request
 from chat_shell import apply_chat_shell, chat_composer
 
@@ -467,18 +467,7 @@ def save_uploaded_dataset(uploaded_file: Any) -> Tuple[Optional[Path], Optional[
 def get_installed_ollama_models() -> List[str]:
     configured_model = os.environ.get("PANDA_OLLAMA_MODEL", "qwen2.5:3b")
     try:
-        response = ollama.list()
-        raw_models = response.get("models", []) if isinstance(response, dict) else getattr(response, "models", [])
-
-        names = []
-        for model in raw_models:
-            if isinstance(model, dict):
-                name = model.get("model") or model.get("name")
-            else:
-                name = getattr(model, "model", None) or getattr(model, "name", None)
-            if name:
-                names.append(name)
-
+        names = list_llm_models()
         return sorted(set(names)) if names else [configured_model]
     except Exception:
         return [configured_model]
@@ -1588,7 +1577,6 @@ def get_ollama_content(response: Any) -> str:
 def safe_ollama_chat(model_name: str, prompt, options: Optional[Dict[str, Any]] = None) -> str:
     request_options = dict(options or {})
     request_messages = prompt if isinstance(prompt, list) else [{"role": "user", "content": prompt}]
-    client = ollama.Client(host=os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434"), timeout=180)
     try:
         force_cpu = bool(st.session_state.get("ollama_force_cpu", False))
     except Exception:
@@ -1598,7 +1586,7 @@ def safe_ollama_chat(model_name: str, prompt, options: Optional[Dict[str, Any]] 
         request_options["num_gpu"] = 0
 
     try:
-        response = client.chat(
+        response = llm_chat(
             model=model_name,
             messages=request_messages,
             options=request_options,
@@ -1610,7 +1598,7 @@ def safe_ollama_chat(model_name: str, prompt, options: Optional[Dict[str, Any]] 
             pass
         return get_ollama_content(response).strip()
     except Exception as first_error:
-        if request_options.get("num_gpu") == 0:
+        if request_options.get("num_gpu") == 0 or using_gateway():
             try:
                 st.session_state["last_ollama_error"] = str(first_error)
             except Exception:
@@ -1620,7 +1608,7 @@ def safe_ollama_chat(model_name: str, prompt, options: Optional[Dict[str, Any]] 
         cpu_options = dict(request_options)
         cpu_options["num_gpu"] = 0
         try:
-            response = client.chat(
+            response = llm_chat(
                 model=model_name,
                 messages=request_messages,
                 options=cpu_options,

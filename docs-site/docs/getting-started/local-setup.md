@@ -1,21 +1,23 @@
 ---
 id: local-setup
-title: Run Canopy locally
+title: Run PANDA locally
 description: Start Ollama, qwen2.5:3b, Streamlit, and the documentation site.
 ---
 
-# Run Canopy locally
+# Run PANDA locally
 
-The supported project location is:
+Use the active PANDA repository checkout on the PERSEUS drive. Depending on the
+copy being tested, the folder may be named `PANDA` or a staging checkout.
 
 ```text
-/Volumes/PERSEUS 4TB/PERSEUS/tree_ai_demo
+/Volumes/PERSEUS 4TB/PERSEUS/PANDA
 ```
 
-From that directory, the launcher starts the bundled Ollama runtime when necessary and then starts Streamlit:
+From that directory, activate the native macOS environment and start Streamlit:
 
 ```bash
-./run_canopy.sh
+source .venv/bin/activate
+python -m streamlit run app.py
 ```
 
 The preferred local model is `qwen2.5:3b`. Confirm the local runtime and models with:
@@ -24,15 +26,17 @@ The preferred local model is `qwen2.5:3b`. Confirm the local runtime and models 
 OLLAMA_HOST=127.0.0.1:11434 tools/Ollama.app/Contents/Resources/ollama list
 ```
 
-To run Streamlit directly instead of using the launcher:
+If the environment was moved from another computer or `python`/`streamlit` is
+missing after activation, recreate it in the current folder:
 
 ```bash
-cd "/Volumes/PERSEUS 4TB/PERSEUS/tree_ai_demo"
+python3 -m venv .venv
 source .venv/bin/activate
-streamlit run app.py
+python -m pip install -r requirements.txt
 ```
 
-The former `.venv` was a Windows environment copied onto the Mac, so it had no usable `.venv/bin/python` or `.venv/bin/streamlit`. It was preserved as `.venv_windows_backup_20260805`, and a native environment was created on the PERSEUS drive.
+Virtual environments are platform-specific and should not be copied between
+Windows, macOS, Irene, or Railway.
 
 If a hidden filename beginning with `._` appears on an external drive, it is macOS metadata rather than project data. Canopy now ignores such files automatically.
 
