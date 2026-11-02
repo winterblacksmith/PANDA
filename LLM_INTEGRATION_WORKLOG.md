@@ -367,3 +367,24 @@ git status --short --branch
 git commit -m "Add authenticated Irene FastAPI inference gateway"
 git push origin integration/irene-fastapi
 ```
+
+Publication result:
+
+- The staging and cached-diff checks passed.
+- Commit `182e396` was created with message
+  `Add authenticated Irene FastAPI inference gateway`.
+- The first `git push origin integration/irene-fastapi` attempt failed because
+  restricted local networking could not resolve `github.com`.
+- The same recorded push command was rerun with approved network access and
+  successfully updated the remote branch from `29db258` to `182e396`.
+
+The final log-only follow-up uses these recorded commands:
+
+```bash
+git add LLM_INTEGRATION_WORKLOG.md
+git diff --cached --check
+git commit -m "Record FastAPI integration validation results"
+git push origin integration/irene-fastapi
+git status --short --branch
+git log -2 --oneline
+```
