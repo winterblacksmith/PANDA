@@ -70,3 +70,14 @@ Result:
 - The PERSEUS volume must be reconnected before its authoritative local worktree can be inspected.
 - The current public HTTPS route from Railway to Irene has not yet been selected or verified.
 - Irene gateway container permissions must be corrected and rebuilt.
+### 2026-11-01, internal-copy search
+
+Working directory: `/private/tmp`
+
+```bash
+find '/Users/shishirl/.codex/visualizations/2026/07/17/019f71a8-f409-7671-92fa-1835efa095c0' -path '*/inference_gateway/main.py' -print
+find '/Users/shishirl/.codex/visualizations/2026/07/17/019f71a8-f409-7671-92fa-1835efa095c0' -name 'docker-compose.llm.yml' -print
+find '/Users/shishirl/.codex/visualizations/2026/07/17/019f71a8-f409-7671-92fa-1835efa095c0' -path '*/scripts/local_llm.sh' -print
+```
+
+Result: no matching gateway, Compose, or helper-script files were found in the available internal Codex working copies. The implementation will be recreated on the integration branch from the previously established design and covered by tests.
