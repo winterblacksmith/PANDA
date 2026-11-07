@@ -388,3 +388,130 @@ git push origin integration/irene-fastapi
 git status --short --branch
 git log -2 --oneline
 ```
+
+## Claude Code handoff document, November 1, 2026
+
+The publication follow-up above completed successfully as commit `cb20f4b` and
+was pushed. The branch was clean before creating the handoff.
+
+The user then asked whether a comprehensive context document existed and requested
+a single handoff document for Claude Code. Read-only inspection commands used:
+
+```bash
+rg --files -g '*.md' -g 'CLAUDE*' -g 'AGENTS.md' -g '!node_modules' -g '!.venv*' -g '!build' -g '!.git' | head -n 100
+sed -n '1,110p' docs-site/docs/implementation-walkthrough.md
+sed -n '1,90p' docs-site/docs/architecture/sql-chat.md
+sed -n '1,70p' docs-site/docs/overview.md
+git status --short --branch
+git log -3 --oneline
+sed -n '1,220p' llm_client.py
+sed -n '1,180p' scripts/local_llm.sh
+sed -n '1,100p' railway.toml
+sed -n '1,110p' Dockerfile
+rg -n '^def |^class |sqlite|PANDA_STORAGE' fvs_integration.py conversation.py conversation_report.py app.py | head -n 100
+```
+
+Result: no single comprehensive current handoff existed. Confirmed clean branch
+at `cb20f4b`, model adapter behavior, helper limitations, Railway build/start
+configuration, and SQLite/storage call sites. Older docs still use Canopy and
+describe local-only deployment, so those claims were flagged as historical.
+
+File edits made with the patch editor:
+
+- Created `PANDA_CLAUDE_HANDOFF.md` with project identity, user preferences,
+  architecture, source map, branch and path history, SQL/FVS/raster semantics,
+  configuration, security constraints, test evidence, unverified infrastructure,
+  known implementation caveats, ordered continuation plan, and acceptance tests.
+- Included the mandatory per-command Irene approval rule and the requirement to
+  maintain this log. Included no secret values.
+- Updated this worklog with the inspection commands and handoff creation record.
+
+Final local validation commands (recorded before execution):
+
+```bash
+git diff --check
+wc -l -w PANDA_CLAUDE_HANDOFF.md
+git status --short --branch
+```
+
+The handoff and this log addition are local changes, not a new deployment or
+publication. No Irene command or Railway mutation was performed.
+
+## Railway to Irene verification preparation
+
+Commands ran in the internal `PANDA-fastapi-integration` checkout:
+
+```bash
+git status --short --branch
+git log -3 --oneline
+ls /Volumes
+sed -n '1,100p' scripts/local_llm.sh
+command -v railway
+bash -n scripts/local_llm.sh && git diff --check && .venv-test/bin/python -m pytest -q tests
+```
+
+The checkout was at `cb20f4b` with local handoff edits. PERSEUS was not
+mounted and the Railway CLI was not found. Added a gateway smoke check that
+fails on HTTP errors, missing authentication enforcement, a missing model,
+or an empty/incomplete generation. Also fixed the optional logs argument.
+Shell syntax and diff checks passed; all 28 local tests passed (13 warnings).
+The new test used mocked Ollama, not live Irene inference. Changes are local.
+No Irene command, Railway mutation, commit, or push was performed.
+
+## 2026-11-06: Live Irene inference verified
+
+User approved continuing the proposed short local inference test. Read-only
+terminal snapshots showed the rebuilt gateway running and authenticated tags
+working. User-run logs showed the earlier Ollama chat completed in 63 seconds,
+after the caller's 60-second timeout.
+
+Commands executed by this agent in this step:
+- `ssh -o BatchMode=yes -o ConnectTimeout=10 shishir@128.192.48.10 'sed -n "1,200p" ~/PANDA/inference_gateway/main.py'`
+  First restricted attempt was denied locally; approved elevated retry succeeded.
+- `ssh -o BatchMode=yes -o ConnectTimeout=10 shishir@128.192.48.10 'cd ~/PANDA && python3 -'`
+  Python supplied over stdin read `docker compose --env-file .env.local-llm -f
+  docker-compose.llm.yml config --format json` in memory, then POSTed one
+  authenticated request to `http://127.0.0.1:8000/api/chat`. Payload: model
+  `qwen2.5:3b`, message `Reply with only the word READY.`, `stream:false`,
+  `keep_alive:0`, `options.num_predict:8`, client timeout 120 seconds.
+
+Result: HTTP 200, model qwen2.5:3b, reply READY, elapsed 4.57 seconds,
+load_duration 4416860677 ns, prompt_eval_duration 72205000 ns,
+eval_duration 15918000 ns, eval_count 2. No secrets printed or persisted.
+No server files, containers, host settings, public ingress, or Railway settings
+were changed by these commands. This verifies local inference, not Railway
+connectivity. Shared compute was used for this single approved request.
+
+## 2026-11-07: Consolidated session record and contract warning
+
+Added IRENE_SESSION_RECORD.md covering user-run commands, agent-run SSH and
+the complete successful inference script, outcomes, uncertainties, safety
+boundaries and next steps. Token values are excluded. Local llm_client.py uses
+/v1/models and /v1/chat, while the running Irene gateway inspected remotely
+uses /api/tags and /api/chat. Align these before configuring Railway.
+PERSEUS is not mounted; documents remain in the internal integration checkout.
+No Irene or Railway changes, commit, or push during this documentation task.
+
+## 2026-11-07: Documentation publication requested
+
+User requested publishing the logs and detailed administrator/Railway steps.
+Added RAILWAY_IRENE_DEPLOYMENT_PLAN.md: two alternative ingress routes, port
+scope, reviewed gateway API migration, staging variables/tests and rollback.
+This is a proposed runbook; its deployment commands have NOT been executed.
+Read-only local inspection included `git status --short --branch`,
+`git remote -v`, `git diff --stat -- LLM_INTEGRATION_WORKLOG.md`,
+`git log -1 --format='%h %s'`, and sed of gateway/client/Compose files.
+Consulted official Railway environment/variable and Cloudflare firewall docs.
+Publication commands for this docs-only change:
+
+```bash
+git diff --check
+git add -- LLM_INTEGRATION_WORKLOG.md IRENE_SESSION_RECORD.md RAILWAY_IRENE_DEPLOYMENT_PLAN.md
+git diff --cached --stat
+git commit -m "Document Irene inference verification and Railway rollout plan"
+git push origin HEAD:integration/irene-fastapi
+git status --short --branch
+```
+
+Commit/push results are reported in chat; do not infer success from this command
+record alone. Existing unfinished code and handoff changes are excluded.
