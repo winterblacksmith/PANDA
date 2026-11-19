@@ -515,3 +515,34 @@ git status --short --branch
 
 Commit/push results are reported in chat; do not infer success from this command
 record alone. Existing unfinished code and handoff changes are excluded.
+
+## 2026-11-19: Hosted-first provider chain (Groq -> Gemini -> local)
+
+User asked to route PANDA to Groq and Gemini free-tier models first, with the
+local route as fallback. Edits:
+
+- `llm_client.py`: `chat()` now walks `provider_chain()`. Default order is
+  groq, gemini, local; hosted providers are included only when `GROQ_API_KEY` /
+  `GEMINI_API_KEY` is set. `PANDA_LLM_PROVIDERS` overrides order/membership.
+  Hosted calls use the OpenAI-compatible chat-completions endpoints via httpx
+  (no new dependency). Ollama options map `num_predict`->`max_tokens`,
+  `temperature`, `top_p`; GPU/context options are dropped for hosted calls.
+  Fallback on 401/403/404/408/409/413/422/429/5xx, network errors, malformed or
+  empty answers. Per-provider cooldown (Retry-After or 60 s; 600 s for bad
+  keys). Responses carry `provider`, `provider_label`, `fallback_errors`.
+  Existing gateway/direct-Ollama code is unchanged as the `local` provider.
+- `app.py`: runtime caption reports which provider answered; CPU retry only
+  runs when direct Ollama is the only provider.
+- `model_connection.py`: connection test exercises the full chain and names the
+  provider that answered plus earlier failures; panel shows the chain order.
+- `tests/test_llm_router.py`: 9 mocked tests (order, key gating, option mapping,
+  429 fallthrough + cooldown, local fallback, empty answers, total failure,
+  key not leaked into errors). Full suite: 36 passed, 3 upstream warnings.
+- Defaults chosen after checking provider docs on 2026-11-19: Groq lists
+  llama-3.3-70b/3.1-8b as Enterprise-only, so the default is
+  `openai/gpt-oss-120b`; Gemini default is `gemini-2.5-flash` (free tier;
+  Google may use free-tier content to improve products, noted in README).
+
+Not done: no live Groq/Gemini request (no keys in this environment), no Railway
+variable change, no Irene command, no push. The previously logged Irene
+gateway route mismatch (`/api/*` vs `/v1/*`) still affects the local fallback.

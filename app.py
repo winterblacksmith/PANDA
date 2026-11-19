@@ -29,7 +29,7 @@ from fvs_integration import discover_fvs_csvs
 from map_basemaps import carto_basemap
 from report_ui import render_report_panel
 from model_connection import render_model_connection
-from llm_client import chat as llm_chat, list_models as list_llm_models, using_gateway
+from llm_client import chat as llm_chat, list_models as list_llm_models, local_only, using_gateway
 from conversation import chat_messages, is_data_request
 from chat_shell import apply_chat_shell, chat_composer
 
@@ -1574,6 +1574,19 @@ def get_ollama_content(response: Any) -> str:
         return ""
 
 
+def _describe_llm_runtime(response: Any, request_options: Dict[str, Any]) -> str:
+    provider = response.get("provider") if isinstance(response, dict) else None
+    if provider and provider != "local":
+        label = response.get("provider_label") or provider
+        return f"{label} ({response.get('model') or 'hosted model'})"
+    if isinstance(response, dict) and response.get("fallback_errors"):
+        base = response.get("provider_label") or "Local model"
+        return f"{base} (fallback after hosted providers failed)"
+    if isinstance(response, dict) and response.get("provider_label") == "Irene gateway":
+        return "Irene gateway"
+    return "CPU" if request_options.get("num_gpu") == 0 else "Ollama (automatic hardware selection)"
+
+
 def safe_ollama_chat(model_name: str, prompt, options: Optional[Dict[str, Any]] = None) -> str:
     request_options = dict(options or {})
     request_messages = prompt if isinstance(prompt, list) else [{"role": "user", "content": prompt}]
@@ -1592,13 +1605,14 @@ def safe_ollama_chat(model_name: str, prompt, options: Optional[Dict[str, Any]] 
             options=request_options,
         )
         try:
-            st.session_state["ollama_runtime"] = "CPU" if request_options.get("num_gpu") == 0 else "Ollama (automatic hardware selection)"
+            st.session_state["ollama_runtime"] = _describe_llm_runtime(response, request_options)
             st.session_state.pop("last_ollama_error", None)
         except Exception:
             pass
         return get_ollama_content(response).strip()
     except Exception as first_error:
-        if request_options.get("num_gpu") == 0 or using_gateway():
+        # CPU retry only makes sense when direct local Ollama is the sole provider.
+        if request_options.get("num_gpu") == 0 or using_gateway() or not local_only():
             try:
                 st.session_state["last_ollama_error"] = str(first_error)
             except Exception:

@@ -21,6 +21,34 @@ PANDA_STORAGE_DIR=/app/storage
 CARTO_API_KEY=your-carto-basemaps-key
 ```
 
+### Hosted free-tier providers with local fallback
+
+PANDA routes each model request through an ordered provider chain. By default
+it tries **Groq**, then **Google Gemini**, then the **local route** (the Irene
+gateway when `PANDA_INFERENCE_URL` is set, otherwise direct Ollama). A hosted
+provider is only used when its API key is set, so leaving both keys unset keeps
+the original local-only behavior.
+
+```text
+GROQ_API_KEY=<Railway secret>
+GEMINI_API_KEY=<Railway secret>
+PANDA_LLM_PROVIDERS=groq,gemini,local   # optional; order and membership
+PANDA_GROQ_MODEL=openai/gpt-oss-120b    # optional override
+PANDA_GEMINI_MODEL=gemini-2.5-flash     # optional override
+```
+
+PANDA falls through to the next provider on rate limits (429), timeouts, outages,
+oversized requests, invalid keys, or empty answers. A provider that rate-limits
+is skipped for its `Retry-After` period (default 60 s) so later questions do not
+pay the failed-request latency again. Every answer records which provider
+produced it; the sidebar runtime caption and **Test model connection** panel
+show that provider plus any earlier failures, so a fallback is never silent.
+
+Data note: prompts include dataset summaries and query results. Gemini's free
+tier allows Google to use prompts and responses to improve its products. If a
+dataset must not leave UGA systems, set `PANDA_LLM_PROVIDERS=local` (or drop
+`gemini`) for that deployment.
+
 The storage volume preserves PANDA's SQLite chat database across deployments.
 Repository datasets remain part of the deployed image.
 
