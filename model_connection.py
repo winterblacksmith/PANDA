@@ -176,7 +176,7 @@ def _ring_color(fraction):
     return "#5CC285"
 
 
-def usage_ring_html(rows, last=None):
+def usage_ring_html(rows, last=None, error=None):
     """Circle showing the highest share of today's quota used; hover/focus reveals exact numbers."""
     from html import escape as esc
 
@@ -225,6 +225,11 @@ def usage_ring_html(rows, last=None):
            f'<circle cx="16" cy="16" r="13" fill="none" stroke="{_ring_color(peak)}" stroke-width="3.2" '
            f'stroke-linecap="round" stroke-dasharray="{dash:.2f} {circumference:.2f}"/></svg>')
     pct = f"{peak * 100:.0f}%" if fractions else "–"
+    if error:
+        pct = "!"
+        card = ('<div class="panda-usage-card" role="tooltip"><h4>Model usage today</h4>'
+                f'<div class="row"><span>Usage could not be read ({esc(str(error))}).</span></div>'
+                '<div class="foot">Answers still work; the counter will recover on the next refresh.</div></div>')
     return (f'<div class="panda-usage" tabindex="0" aria-label="Model usage today: {pct} of the tightest daily limit used">'
             f'{svg}<span class="pct">{pct}</span>{card}</div>')
 
@@ -236,4 +241,5 @@ def render_usage_ring():
         chain = []
     data = llm_usage.provider_rows(providers=chain or None)
     with st.container(key="panda-topbar-usage"):
-        st.markdown(usage_ring_html(data["rows"], st.session_state.get("last_llm_usage")), unsafe_allow_html=True)
+        st.markdown(usage_ring_html(data["rows"], st.session_state.get("last_llm_usage"), data.get("error")),
+                    unsafe_allow_html=True)
