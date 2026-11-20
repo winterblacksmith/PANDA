@@ -30,15 +30,25 @@ HOSTED_PROVIDERS: Dict[str, Dict[str, str]] = {
         "key_env": "GROQ_API_KEY",
         "model_env": "PANDA_GROQ_MODEL",
         "default_model": "openai/gpt-oss-120b",
+        "fallback_env": "PANDA_GROQ_FALLBACK_MODELS",
+        "default_fallbacks": "openai/gpt-oss-20b",
     },
     "gemini": {
         "label": "Google Gemini",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "key_env": "GEMINI_API_KEY",
         "model_env": "PANDA_GEMINI_MODEL",
-        "default_model": "gemini-2.5-flash",
+        # Same defaults as KTPI, which works on the free tier.
+        "default_model": "gemini-3.5-flash-lite",
+        "fallback_env": "PANDA_GEMINI_FALLBACK_MODELS",
+        "default_fallbacks": "gemini-3.1-flash-lite,gemini-3.5-flash",
     },
 }
+# Reasoning models think before answering, and those thinking tokens count
+# against max_tokens. A small cap (e.g. 24 for the connection test) leaves no
+# room for the answer, which comes back empty. Keep effort low and a generous cap.
+REASONING_EFFORT = os.environ.get("PANDA_REASONING_EFFORT", "low").strip()
+REASONING_MIN_TOKENS = 2048
 KNOWN_PROVIDERS = tuple(HOSTED_PROVIDERS) + ("local",)
 
 # Errors worth moving to the next provider for (rate limit, overload, outage,
@@ -128,6 +138,24 @@ def hosted_model(name: str) -> str:
     return os.environ.get(spec["model_env"], "").strip() or spec["default_model"]
 
 
+def hosted_models(name: str) -> List[str]:
+    """Primary model then fallbacks, de-duplicated, in order."""
+    spec = HOSTED_PROVIDERS[name]
+    raw = os.environ.get(spec["fallback_env"], spec["default_fallbacks"])
+    models = [hosted_model(name)] + [m.strip() for m in raw.split(",") if m.strip()]
+    return list(dict.fromkeys(models))
+
+
+def _is_reasoning_model(model: str) -> bool:
+    return model.startswith("gemini") or "gpt-oss" in model
+
+
+def _local_unreachable_on_railway() -> bool:
+    """On Railway with no Irene gateway, 127.0.0.1:11434 has no Ollama behind it."""
+    on_railway = any(os.environ.get(k) for k in ("RAILWAY_ENVIRONMENT", "RAILWAY_ENVIRONMENT_NAME", "RAILWAY_PROJECT_ID"))
+    return on_railway and not using_gateway() and not os.environ.get("OLLAMA_HOST", "").strip()
+
+
 def provider_chain() -> List[str]:
     """Ordered providers to try. Hosted providers without a key are skipped."""
     raw = os.environ.get("PANDA_LLM_PROVIDERS", "").strip()
@@ -141,6 +169,8 @@ def provider_chain() -> List[str]:
             )
     else:
         requested = list(KNOWN_PROVIDERS)
+        if _local_unreachable_on_railway():
+            requested.remove("local")
     chain: List[str] = []
     for name in requested:
         if name in chain:
@@ -208,19 +238,31 @@ def _openai_payload(model: str, messages: List[Dict[str, str]], options: Dict[st
         payload["temperature"] = options["temperature"]
     if "top_p" in options:
         payload["top_p"] = options["top_p"]
-    if options.get("num_predict"):
-        payload["max_tokens"] = int(options["num_predict"])
+    requested = int(options["num_predict"]) if options.get("num_predict") else 0
+    if _is_reasoning_model(model):
+        if REASONING_EFFORT:
+            payload["reasoning_effort"] = REASONING_EFFORT
+        payload["max_tokens"] = max(requested, REASONING_MIN_TOKENS)
+    elif requested:
+        payload["max_tokens"] = requested
     return payload
 
 
-def _hosted_chat(
+class _ModelFailure(Exception):
+    def __init__(self, message: str, status: Optional[int] = None, retry_after: float = 0.0):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
+def _hosted_model_chat(
     name: str,
+    model: str,
     messages: List[Dict[str, str]],
     options: Dict[str, Any],
     timeout: float,
 ) -> Dict[str, Any]:
     spec = HOSTED_PROVIDERS[name]
-    model = hosted_model(name)
     try:
         response = httpx.post(
             f"{spec['base_url']}/chat/completions",
@@ -229,29 +271,50 @@ def _hosted_chat(
             timeout=timeout,
         )
     except httpx.HTTPError as exc:
-        _start_cooldown(name, DEFAULT_COOLDOWN_SECONDS)
-        raise LLMConnectionError(f"{spec['label']} request failed ({type(exc).__name__})") from exc
-
+        raise _ModelFailure(f"{model}: request failed ({type(exc).__name__})") from exc
     if response.status_code >= 400:
-        if response.status_code in (401, 403):
-            # A bad key will not fix itself; skip this provider for longer.
-            _start_cooldown(name, MAX_COOLDOWN_SECONDS)
-        elif response.status_code in FALLBACK_STATUS_CODES:
-            _start_cooldown(name, _retry_after_seconds(response) if response.status_code == 429 else DEFAULT_COOLDOWN_SECONDS)
-        raise LLMConnectionError(f"{spec['label']} returned HTTP {response.status_code}")
-
+        reason = {401: "API key rejected", 403: "API key not allowed for this model",
+                  404: "model not found or retired", 429: "rate limited",
+                  503: "overloaded"}.get(response.status_code, "error")
+        retry = _retry_after_seconds(response) if response.status_code == 429 else 0.0
+        raise _ModelFailure(f"{model}: HTTP {response.status_code} {reason}", response.status_code, retry)
     try:
         payload = response.json()
         content = payload["choices"][0]["message"].get("content") or ""
     except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
-        raise LLMConnectionError(f"{spec['label']} returned an unexpected response shape") from exc
+        raise _ModelFailure(f"{model}: unexpected response shape") from exc
     if not str(content).strip():
-        raise LLMConnectionError(f"{spec['label']} returned an empty answer")
+        raise _ModelFailure(f"{model}: empty answer")
     return {
         "model": payload.get("model") or model,
         "message": {"role": "assistant", "content": str(content)},
         "done": True,
     }
+
+
+def _hosted_chat(
+    name: str,
+    messages: List[Dict[str, str]],
+    options: Dict[str, Any],
+    timeout: float,
+) -> Dict[str, Any]:
+    """Try the provider's primary model, then its fallback models."""
+    label = HOSTED_PROVIDERS[name]["label"]
+    failures: List[str] = []
+    rate_limited = 0.0
+    for model in hosted_models(name):
+        try:
+            return _hosted_model_chat(name, model, messages, options, timeout)
+        except _ModelFailure as exc:
+            failures.append(str(exc))
+            if exc.status == 401:
+                # A rejected key fails for every model; stop and skip this provider for a while.
+                _start_cooldown(name, MAX_COOLDOWN_SECONDS)
+                raise LLMConnectionError(f"{label}: {exc}") from exc
+            if exc.status == 429:
+                rate_limited = max(rate_limited, exc.retry_after)
+    _start_cooldown(name, rate_limited or DEFAULT_COOLDOWN_SECONDS)
+    raise LLMConnectionError(f"{label} failed ({'; '.join(failures)})")
 
 
 def _local_chat(

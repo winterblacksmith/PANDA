@@ -546,3 +546,31 @@ local route as fallback. Edits:
 Not done: no live Groq/Gemini request (no keys in this environment), no Railway
 variable change, no Irene command, no push. The previously logged Irene
 gateway route mismatch (`/api/*` vs `/v1/*`) still affects the local fallback.
+
+## 2026-11-20: Fixes after first live Railway test of hosted providers
+
+User's staging test reported: "Groq returned an empty answer; Google Gemini
+returned HTTP 404; Direct Ollama chat failed: Failed to connect to Ollama."
+Compared with the working KTPI backend (ktpuga/KTPI, backend/app/ai.py and
+config.py), which sends reasoning_effort=low to gpt-oss/Gemini, sets no tiny
+token cap, defaults Gemini to gemini-3.5-flash-lite, and falls back across
+models within a provider on 404/429/5xx.
+
+Causes and fixes in `llm_client.py`:
+- Groq empty answer: gpt-oss-120b reasons before answering and the reasoning
+  counts against max_tokens; the connection test sent max_tokens=24. Now sends
+  reasoning_effort=low (PANDA_REASONING_EFFORT) and max_tokens >= 2048 for
+  reasoning models.
+- Gemini 404: gemini-2.5-flash not available to this key. Default is now
+  gemini-3.5-flash-lite (KTPI's working default) with per-provider fallback
+  models (PANDA_GROQ_FALLBACK_MODELS / PANDA_GEMINI_FALLBACK_MODELS).
+  A 401 stops trying that provider's other models.
+- Ollama failure: Railway has no local Ollama. Local is now excluded from the
+  default chain on Railway when no Irene gateway URL or OLLAMA_HOST is set.
+- `model_connection.py`: removed the variable-setup code blocks from the UI.
+  They contained only literal placeholders (no real keys were displayed), but
+  setup notes do not belong in the user-facing app; README covers them.
+- `scripts/bench_providers.py`: per-provider timing script (no fallback).
+
+Tests: 39 passed (12 router tests incl. 404 model fallback, reasoning payload,
+Railway local skip). Not yet re-verified live on Railway.

@@ -9,7 +9,7 @@ from llm_client import (
     LLMConnectionError,
     chat,
     connection_label,
-    hosted_model,
+    hosted_models,
     provider_chain,
     provider_label,
     using_gateway,
@@ -72,7 +72,7 @@ def _chain_summary(local_model):
         return "No providers configured."
     parts = []
     for name in chain:
-        model = hosted_model(name) if name in HOSTED_PROVIDERS else local_model
+        model = " / ".join(hosted_models(name)) if name in HOSTED_PROVIDERS else local_model
         parts.append(f"{provider_label(name)} ({model})")
     return "Order: " + " -> ".join(parts)
 
@@ -99,9 +99,4 @@ def render_model_connection():
         result = st.session_state.get("panda_model_test")
         if result and result[:2] == (raw_host, model):
             (st.success if result[2] else st.error)(result[3])
-        st.markdown("**Hosted providers (tried first when a key is set)**")
-        st.code("GROQ_API_KEY=<Railway secret>\nGEMINI_API_KEY=<Railway secret>\n"
-                "PANDA_LLM_PROVIDERS=groq,gemini,local", language="text")
-        st.markdown("**Railway to Irene setup**")
-        st.code("PANDA_INFERENCE_URL=https://your-approved-gateway.example.edu\nPANDA_INFERENCE_TOKEN=<Railway secret>\nPANDA_OLLAMA_MODEL=qwen2.5:3b", language="text")
-        st.caption("Only the authenticated FastAPI gateway should be public. Keep Ollama private on Irene.")
+        st.caption("Provider keys and the Irene gateway URL are set as Railway variables; see README.")

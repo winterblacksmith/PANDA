@@ -34,8 +34,17 @@ GROQ_API_KEY=<Railway secret>
 GEMINI_API_KEY=<Railway secret>
 PANDA_LLM_PROVIDERS=groq,gemini,local   # optional; order and membership
 PANDA_GROQ_MODEL=openai/gpt-oss-120b    # optional override
-PANDA_GEMINI_MODEL=gemini-2.5-flash     # optional override
+PANDA_GEMINI_MODEL=gemini-3.5-flash-lite  # optional override
+PANDA_GROQ_FALLBACK_MODELS=openai/gpt-oss-20b
+PANDA_GEMINI_FALLBACK_MODELS=gemini-3.1-flash-lite,gemini-3.5-flash
 ```
+
+Each provider tries its own backup models first (for a retired model 404, a
+rate limit or an outage) before PANDA moves to the next provider. Reasoning
+models (gpt-oss, Gemini) are sent `reasoning_effort=low` and at least 2,048
+output tokens, because their thinking counts against the cap and a small cap
+returns an empty answer. On Railway without `PANDA_INFERENCE_URL`, the local
+provider is left out automatically since there is no Ollama in that container.
 
 PANDA falls through to the next provider on rate limits (429), timeouts, outages,
 oversized requests, invalid keys, or empty answers. A provider that rate-limits
