@@ -1,5 +1,6 @@
 from pathlib import Path
 import importlib
+import os
 
 # Streamlit reruns in the same interpreter. Refresh directory caches when new
 # project modules are added, including on external drives with coarse mtimes.
@@ -19,7 +20,6 @@ from uuid import uuid4
 
 import folium
 import numpy as np
-import ollama
 import pandas as pd
 import streamlit as st
 from PIL import Image
@@ -27,6 +27,13 @@ from folium.plugins import Draw
 from streamlit_folium import st_folium
 from fvs_integration import discover_fvs_csvs
 from map_basemaps import carto_basemap
+from report_ui import render_report_panel
+import dataset_library
+from response_actions import message_text, preceding_question, render_response_actions
+from model_connection import render_model_connection, render_usage_ring
+from llm_client import chat as llm_chat, list_models as list_llm_models, local_only, using_gateway
+from conversation import chat_messages, is_data_request
+from chat_shell import apply_chat_shell, chat_composer
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -36,12 +43,13 @@ except Exception:
 
 DATA_DIR = Path("data")
 RASTER_DIR = Path("rasters")
-STORAGE_DIR = Path("storage")
+STORAGE_DIR = Path(os.environ.get("PANDA_STORAGE_DIR", "storage"))
 SQLITE_DB_PATH = STORAGE_DIR / "canopy.sqlite"
 APP_STATE_VERSION = "stable_chat_tree_ai_2026_06_04_v1"
-APP_NAME = "Canopy"
+APP_NAME = "PANDA"
 APP_DESCRIPTION = (
-    "an AI knowledge base for forestry, tree inventory, and spatial datasets. "
+    "PERSEUS AI for Natural Language Data Analysis: an AI knowledge base for forestry, "
+    "tree inventory, and spatial datasets. "
     "It can summarize existing datasets, answer natural-language questions, filter records, "
     "and map usable location data."
 )
@@ -83,6 +91,8 @@ THEME_PALETTES = {
         "accent_hover": "#195D39",
         "accent_soft": "rgba(36, 118, 75, 0.12)",
         "shadow": "0 12px 34px rgba(23, 63, 43, 0.08)",
+        "cta_bg": "#143024",
+        "cta_fg": "#FFFFFF",
     },
     "Dark": {
         "color_scheme": "dark",
@@ -97,20 +107,25 @@ THEME_PALETTES = {
         "accent_hover": "#7DD39B",
         "accent_soft": "rgba(97, 189, 131, 0.15)",
         "shadow": "0 14px 40px rgba(0, 0, 0, 0.24)",
+        "cta_bg": "#F1F5F2",
+        "cta_fg": "#0D1210",
     },
     "Forest": {
+        # Darker than before so white text has strong contrast (white text is ~18:1 on the background, ~17:1 on the sidebar).
         "color_scheme": "dark",
-        "background": "#071D15",
-        "sidebar": "#0B271D",
-        "surface": "rgba(17, 53, 40, 0.90)",
-        "surface_strong": "#123B2C",
-        "text": "#F2F7F3",
-        "muted": "#B8CBBF",
-        "border": "rgba(216, 239, 224, 0.18)",
-        "accent": "#55B67A",
-        "accent_hover": "#72CB92",
-        "accent_soft": "rgba(85, 182, 122, 0.17)",
-        "shadow": "0 16px 44px rgba(0, 8, 5, 0.30)",
+        "background": "#04120D",
+        "sidebar": "#071B14",
+        "surface": "rgba(13, 40, 30, 0.92)",
+        "surface_strong": "#0E2F23",
+        "text": "#F3F8F4",
+        "muted": "#B3C8BA",
+        "border": "rgba(216, 239, 224, 0.14)",
+        "accent": "#5CC285",
+        "accent_hover": "#7AD69F",
+        "accent_soft": "rgba(92, 194, 133, 0.16)",
+        "shadow": "0 18px 48px rgba(0, 0, 0, 0.45)",
+        "cta_bg": "#F3F8F4",
+        "cta_fg": "#06231A",
     },
 }
 
@@ -135,6 +150,8 @@ def apply_app_theme(theme_name: str) -> None:
             --canopy-accent-hover: {palette['accent_hover']};
             --canopy-accent-soft: {palette['accent_soft']};
             --canopy-shadow: {palette['shadow']};
+            --panda-cta-bg: {palette['cta_bg']};
+            --panda-cta-fg: {palette['cta_fg']};
           }}
 
           .stApp,
@@ -353,7 +370,7 @@ def get_raster_files() -> List[Path]:
     files: List[Path] = []
     seen_paths = set()
 
-    for raster_dir in RASTER_SEARCH_DIRS:
+    for raster_dir in [*RASTER_SEARCH_DIRS, dataset_library.library_raster_dir()]:
         if not raster_dir.exists():
             continue
 
@@ -406,11 +423,12 @@ def get_raster_files() -> List[Path]:
     return sorted(preferred_files.values())
 
 
+def get_library_items() -> List["dataset_library.LibraryItem"]:
+    return dataset_library.list_items(DATA_DIR, RASTER_DIR, get_raster_files())
+
+
 def get_dataset_options() -> List[Tuple[str, Path]]:
-    fvs_options = [("fvs", path) for path in discover_fvs_csvs(DATA_DIR)]
-    csv_options = [("csv", path) for path in get_tree_csv_files()]
-    raster_options = [("raster", path) for path in get_raster_files()]
-    return fvs_options + csv_options + raster_options
+    return [(item.kind, item.path) for item in get_library_items()]
 
 
 def format_dataset_option(option: Tuple[str, Path]) -> str:
@@ -459,22 +477,12 @@ def save_uploaded_dataset(uploaded_file: Any) -> Tuple[Optional[Path], Optional[
 
 
 def get_installed_ollama_models() -> List[str]:
+    configured_model = os.environ.get("PANDA_OLLAMA_MODEL", "qwen2.5:3b")
     try:
-        response = ollama.list()
-        raw_models = response.get("models", []) if isinstance(response, dict) else getattr(response, "models", [])
-
-        names = []
-        for model in raw_models:
-            if isinstance(model, dict):
-                name = model.get("model") or model.get("name")
-            else:
-                name = getattr(model, "model", None) or getattr(model, "name", None)
-            if name:
-                names.append(name)
-
-        return sorted(set(names)) if names else ["qwen2.5:3b", "qwen3.5:9b", "gpt-oss:20b"]
+        names = list_llm_models()
+        return sorted(set(names)) if names else [configured_model]
     except Exception:
-        return ["qwen2.5:3b", "qwen3.5:9b", "gpt-oss:20b"]
+        return [configured_model]
 
 
 @st.cache_data
@@ -483,7 +491,7 @@ def load_csv(path: Path) -> pd.DataFrame:
 
 
 def ensure_storage_dirs() -> None:
-    STORAGE_DIR.mkdir(exist_ok=True)
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     RASTER_DIR.mkdir(exist_ok=True)
 
 
@@ -996,7 +1004,7 @@ def discover_raster_layers() -> List[Dict[str, Any]]:
     layers: List[Dict[str, Any]] = []
     seen_paths = set()
 
-    for raster_dir in RASTER_SEARCH_DIRS:
+    for raster_dir in [*RASTER_SEARCH_DIRS, dataset_library.library_raster_dir()]:
         if not raster_dir.exists():
             continue
 
@@ -1373,7 +1381,7 @@ def interpret_raster_question(question: str, model_name: str, use_model: bool) -
 
     if use_model:
         prompt = f"""
-Classify the user's question about Canopy or its selected raster dataset.
+Classify the user's question about PANDA or its selected raster dataset.
 Return JSON only in this exact shape: {{"intent": "one_label"}}
 
 Allowed labels:
@@ -1382,7 +1390,7 @@ Allowed labels:
 - location: asks where the raster is, its coverage, bounds, or extent
 - dimensions: asks about width, height, bands, file size, or resolution
 - value_summary: asks about pixels, values, statistics, minimum, maximum, mean, median, or distinct values
-- current_capabilities: asks what Canopy can currently do with the raster
+- current_capabilities: asks what PANDA can currently do with the raster
 - point_sampling: asks what is needed to sample raster values at points
 - polygon_analysis: asks about drawn polygons, zonal analysis, or values inside an area
 - inventory_connection: asks how the raster connects or joins to a tree inventory or CSV
@@ -1414,7 +1422,7 @@ User question: {question}
         return "forest_types"
     if any(term in lowered for term in ["tm_id", "plot id", "pixel code", "band 1 represent", "values represent"]):
         return "attribute_meaning"
-    if "canopy" in lowered and any(term in lowered for term in ["do", "support", "right now"]):
+    if any(name in lowered for name in ["panda", "canopy"]) and any(term in lowered for term in ["do", "support", "right now"]):
         return "current_capabilities"
     if "crs" in lowered or "projection" in lowered:
         return "crs"
@@ -1438,7 +1446,7 @@ def answer_raster_question(question: str, layer: Dict[str, Any], model_name: str
     intent = interpret_raster_question(question, model_name, use_model)
     has_attribute_table = bool(data_summary.get("attribute_rows"))
     attribute_capability = (
-        "The accompanying raster attribute table is available, so Canopy can translate TM_ID pixel values into "
+        "The accompanying raster attribute table is available, so PANDA can translate TM_ID pixel values into "
         "forest type, live basal area, canopy percentage, stand height, live trees per acre, biomass, and carbon attributes."
         if has_attribute_table
         else "No accompanying raster attribute table is available, so numeric codes cannot be translated into named attributes."
@@ -1446,7 +1454,7 @@ def answer_raster_question(question: str, layer: Dict[str, Any], model_name: str
 
     focus_contexts = {
         "current_capabilities": (
-            "Canopy currently reads GeoTIFF metadata, displays the actual Band 1 cells as a color-stretched map "
+            "PANDA currently reads GeoTIFF metadata, displays the actual Band 1 cells as a color-stretched map "
             "layer, calculates whole-raster statistics and common numeric values, and reads an accompanying ArcGIS "
             f"raster attribute table when present. {attribute_capability} It does not yet sample CSV tree points, "
             "calculate statistics inside drawn polygons, or join raster values to inventory rows."
@@ -1470,14 +1478,14 @@ def answer_raster_question(question: str, layer: Dict[str, Any], model_name: str
         "attribute_meaning": format_raster_context(layer),
         "forest_types": format_raster_context(layer),
         "general_chat": (
-            "Canopy is an AI knowledge base for forestry, tree inventory, raster, and spatial datasets. Respond "
+            "PANDA is an AI knowledge base for forestry, tree inventory, raster, and spatial datasets. Respond "
             "naturally to casual conversation and do not force dataset facts into the response."
         ),
     }
     focus_context = focus_contexts.get(intent, format_raster_context(layer))
 
     prompt = f"""
-You are Canopy, an AI knowledge base for forestry, tree inventory, and spatial datasets.
+You are PANDA, an AI knowledge base for forestry, tree inventory, and spatial datasets.
 The question has already been interpreted as: {intent}
 
 Use only this relevant, verified context:
@@ -1509,12 +1517,12 @@ Never invent raster meanings, class names, units, or implemented features.
     if intent == "current_capabilities":
         if has_attribute_table:
             return (
-                "Canopy can read and map this GeoTIFF, summarize its pixels, interpret Band 1 as TreeMap `TM_ID` values, "
+                "PANDA can read and map this GeoTIFF, summarize its pixels, interpret Band 1 as TreeMap `TM_ID` values, "
                 "and use the accompanying attribute table to report forest type and structural attributes. Point "
                 "sampling and polygon statistics are not implemented yet."
             )
         return (
-            "Canopy can currently read this GeoTIFF, display its actual Band 1 cells, and summarize its metadata and "
+            "PANDA can currently read this GeoTIFF, display its actual Band 1 cells, and summarize its metadata and "
             "whole-raster values. Point sampling, polygon statistics, and code translation are the next steps."
         )
     if intent == "general_chat":
@@ -1552,7 +1560,7 @@ def make_raster_suggested_questions(layer: Dict[str, Any]) -> List[str]:
         "What CRS does this raster use?",
         "Where is this raster located?",
         "What are the raster dimensions?",
-        "What can Canopy do with this raster right now?",
+        "What can PANDA do with this raster right now?",
         "What do the Band 1 pixel values represent?",
         "What are the dominant forest types in this raster?",
         "What is needed to sample raster values at tree points?",
@@ -1578,8 +1586,22 @@ def get_ollama_content(response: Any) -> str:
         return ""
 
 
-def safe_ollama_chat(model_name: str, prompt: str, options: Optional[Dict[str, Any]] = None) -> str:
+def _describe_llm_runtime(response: Any, request_options: Dict[str, Any]) -> str:
+    provider = response.get("provider") if isinstance(response, dict) else None
+    if provider and provider != "local":
+        label = response.get("provider_label") or provider
+        return f"{label} ({response.get('model') or 'hosted model'})"
+    if isinstance(response, dict) and response.get("fallback_errors"):
+        base = response.get("provider_label") or "Local model"
+        return f"{base} (fallback after hosted providers failed)"
+    if isinstance(response, dict) and response.get("provider_label") == "Irene gateway":
+        return "Irene gateway"
+    return "CPU" if request_options.get("num_gpu") == 0 else "Ollama (automatic hardware selection)"
+
+
+def safe_ollama_chat(model_name: str, prompt, options: Optional[Dict[str, Any]] = None) -> str:
     request_options = dict(options or {})
+    request_messages = prompt if isinstance(prompt, list) else [{"role": "user", "content": prompt}]
     try:
         force_cpu = bool(st.session_state.get("ollama_force_cpu", False))
     except Exception:
@@ -1589,19 +1611,23 @@ def safe_ollama_chat(model_name: str, prompt: str, options: Optional[Dict[str, A
         request_options["num_gpu"] = 0
 
     try:
-        response = ollama.chat(
+        response = llm_chat(
             model=model_name,
-            messages=[{"role": "user", "content": prompt}],
+            messages=request_messages,
             options=request_options,
         )
         try:
-            st.session_state["ollama_runtime"] = "CPU" if request_options.get("num_gpu") == 0 else "GPU"
+            st.session_state["ollama_runtime"] = _describe_llm_runtime(response, request_options)
+            if isinstance(response, dict) and response.get("usage"):
+                st.session_state["last_llm_usage"] = dict(response["usage"],
+                                                          label=response.get("provider_label") or "model")
             st.session_state.pop("last_ollama_error", None)
         except Exception:
             pass
         return get_ollama_content(response).strip()
     except Exception as first_error:
-        if request_options.get("num_gpu") == 0:
+        # CPU retry only makes sense when direct local Ollama is the sole provider.
+        if request_options.get("num_gpu") == 0 or using_gateway() or not local_only():
             try:
                 st.session_state["last_ollama_error"] = str(first_error)
             except Exception:
@@ -1611,9 +1637,9 @@ def safe_ollama_chat(model_name: str, prompt: str, options: Optional[Dict[str, A
         cpu_options = dict(request_options)
         cpu_options["num_gpu"] = 0
         try:
-            response = ollama.chat(
+            response = llm_chat(
                 model=model_name,
-                messages=[{"role": "user", "content": prompt}],
+                messages=request_messages,
                 options=cpu_options,
             )
             try:
@@ -1756,18 +1782,9 @@ FOLLOWUP_WORDS = [
 
 
 def classify_prompt_type(prompt: str) -> str:
-    q = prompt.lower().strip()
-
-    if not q:
+    if not prompt.strip():
         return "empty"
-
-    if any(term in q for term in DATA_ACTION_WORDS):
-        return "data"
-
-    if any(species in q for species in SPECIES_WORDS):
-        return "data"
-
-    return "general_chat"
+    return "data" if is_data_request(prompt) else "general_chat"
 
 
 def question_is_map_request(question: str) -> bool:
@@ -2940,53 +2957,57 @@ def build_result(
 # AI responses
 # -----------------------------
 
-def explain_general_chat(prompt: str, model_name: str, use_model_explanation: bool) -> str:
-    q = prompt.lower().strip()
+FVS_CAPABILITY_NOTE = (
+    "PANDA's FVS tools can, on request: summarize stands (count, acres, mean age, total volume as TCuFt x Acres), "
+    "filter by Age, Acres, TCuFt and other columns, chart acres or stand counts by age class, map stand polygons "
+    "(MU_ID joins the shapefile), and overlay matching TreeMap raster cells (TM_Value)."
+)
 
-    if any(word in q for word in ["hi", "hello", "hey"]) and len(q.split()) <= 4:
-        return f"Hi. What would you like to explore in {APP_NAME}?"
 
-    if "how is your day" in q or "how are you" in q:
-        return "I’m doing well. I’m ready to help with the tree dataset whenever you are."
+@st.cache_data(show_spinner=False, max_entries=16)
+def _profile_table(path_text: str, mtime_ns: int, kind: str) -> str:
+    """Compact, model-safe description of a table: columns, types, ranges, top values. No raw rows."""
+    df = pd.read_csv(path_text, low_memory=False)
+    lines = [f"Name: {Path(path_text).name}", f"Type: {'FVS stand results' if kind == 'fvs' else 'CSV table'}",
+             f"Rows: {len(df):,}", f"Columns ({len(df.columns)}):"]
+    for column in list(df.columns)[:60]:
+        series = df[column]
+        non_null = int(series.notna().sum())
+        if pd.api.types.is_numeric_dtype(series) and non_null:
+            lines.append(f"- {column} (number, {non_null:,} values): min {series.min():,.4g}, "
+                         f"max {series.max():,.4g}, mean {series.mean():,.4g}")
+        else:
+            top = series.dropna().astype(str).value_counts().head(4)
+            sample = ", ".join(f"{str(v)[:30]} ({c:,})" for v, c in top.items())
+            lines.append(f"- {column} (text, {series.nunique(dropna=True):,} distinct): {sample}")
+    if len(df.columns) > 60:
+        lines.append(f"- ...and {len(df.columns) - 60} more columns")
+    if kind == "fvs":
+        lines.append(FVS_CAPABILITY_NOTE)
+    return "\n".join(lines)
 
-    if any(phrase in q for phrase in ["who are you", "what are you", "what is this", "what app is this"]):
-        return (
-            f"I'm the chat assistant for {APP_NAME}, {APP_DESCRIPTION} "
-            "I can answer casual questions too, but my main job is helping you work with forestry and tree-related data."
-        )
 
-    if any(phrase in q for phrase in ["what can you do", "what do you do", "help me", "everything i can do", "tell me everything"]):
-        return (
-            "You can ask me to summarize datasets, count trees, list species, filter records by species or traits, "
-            "preview matching rows, and map tree or forestry data when usable coordinates are available."
-        )
+def describe_dataset_for_model(kind: str, path: Path) -> str:
+    try:
+        if kind in {"csv", "fvs"}:
+            return _profile_table(str(path), path.stat().st_mtime_ns, kind)
+        return (f"Name: {path.name}\nType: raster ({path.suffix.lower()})\n"
+                "PANDA can preview this raster, list its metadata (size, cell size, projection, bands) "
+                "and summarize pixel values or attribute-table classes on request.")
+    except Exception as exc:
+        return f"Name: {path.name}\nType: {kind}\n(PANDA could not profile this dataset: {type(exc).__name__})"
 
-    if "favorite pokemon" in q or "favourite pokemon" in q:
-        return "I do not have personal favorites, but Pikachu is probably the classic answer."
 
-    fallback = "I can answer normally too, but I’m mainly set up to help you explore, summarize, filter, and map this tree dataset."
-
-    fallback = f"I can answer normally too, but I am mainly set up to help you explore, summarize, filter, and map forestry and tree datasets in {APP_NAME}."
+def explain_general_chat(prompt: str, model_name: str, use_model_explanation: bool, history=()) -> str:
+    fallback = "AI answers are unavailable right now. Check the Model connection panel in the sidebar for the connection test and setup instructions."
 
     if not use_model_explanation:
-        return fallback
-
-    system_prompt = f"""
-You are a helpful assistant inside {APP_NAME}, {APP_DESCRIPTION}
-The user is casually chatting, not asking for data analysis.
-Answer naturally in 1 to 2 short sentences.
-Do not mention querying the CSV unless the user asks about the dataset.
-Do not describe the app as a programming, binary-tree, heap, or data-structures tool.
-Do not pretend to have personal experiences.
-
-User message:
-{prompt}
-"""
+        return "AI answers are turned off. Enable model answers in the sidebar settings."
 
     text = safe_ollama_chat(
         model_name,
-        system_prompt,
-        options={"temperature": 0.4, "num_predict": 140},
+        chat_messages(prompt, history, dataset_context=st.session_state.get("active_dataset_context", "")),
+        options={"temperature": 0.6, "num_predict": 1200, "num_ctx": 8192},
     )
 
     return text if text else fallback
@@ -2998,125 +3019,58 @@ def explain_result(
     use_model_explanation: bool,
     selected_projected_crs: Optional[str],
 ) -> str:
-    if payload.get("intent") == "species_list":
-        return payload["verified_summary"]
-
+    """Model-written answer grounded in PANDA's verified result (templates only when AI is off/unreachable)."""
     map_requested = bool(payload.get("map_requested"))
     map_available = bool(payload.get("map_available"))
-
-    if map_requested and not map_available:
-        return payload["verified_summary"]
-
-    if not use_model_explanation:
-        if map_requested:
-            return "Here's your map. " + payload["verified_summary"]
-        return payload["verified_summary"]
-
-    if not use_model_explanation:
-        if payload.get("map_requested"):
-            return "Here’s your map. " + payload["verified_summary"]
-        return payload["verified_summary"]
-
-    user_facing_payload = {
-        "question": payload["question"],
-        "intent": payload["intent"],
-        "result_available": payload["result_available"],
-        "matching_record_count": payload["matching_record_count"],
-        "total_dataset_rows": payload["total_dataset_rows"],
-        "percent_of_dataset": payload["percent_of_dataset"],
-        "answer_subject": payload.get("answer_subject"),
-        "display_count_label": payload.get("display_count_label"),
-        "display_count_value": payload.get("display_count_value"),
-        "filters_used": payload["filters_used"],
-        "warnings": payload["warnings"],
-        "verified_summary": payload["verified_summary"],
-        "important_table": payload["important_table"][:10],
-    }
-
-    if payload.get("map_requested"):
-        if selected_projected_crs:
-            user_facing_payload["map_note"] = (
-                f"A map was requested. Coordinate rows available: {payload['coordinate_rows_in_dataset']}. "
-                f"The app transformed the coordinate values using {selected_projected_crs} so they can be displayed on the map."
-            )
-        else:
-            user_facing_payload["map_note"] = (
-                f"A map was requested. Coordinate rows available: {payload['coordinate_rows_in_dataset']}. "
-                "A coordinate system must be selected before these coordinates can be mapped."
-            )
-
+    template = payload["verified_summary"]
     if map_requested and map_available:
-        if payload.get("coordinate_kind") == "projected_crs_required" and selected_projected_crs:
-            user_facing_payload["map_note"] = (
-                f"A map was created for {payload.get('coordinate_rows_in_result', 0)} matching rows. "
-                f"The app transformed the coordinate values using {selected_projected_crs} so they can be displayed on the map."
-            )
+        template = "Here's your map. " + template
+    if not use_model_explanation:
+        return template
+
+    facts: Dict[str, Any] = {
+        "question": payload.get("question"),
+        "what_was_computed": payload.get("intent"),
+        "verified_summary": payload.get("verified_summary"),
+        "matching_records": payload.get("matching_record_count"),
+        "total_records_in_dataset": payload.get("total_dataset_rows"),
+        "percent_of_dataset": payload.get("percent_of_dataset"),
+        "subject": payload.get("answer_subject"),
+        "headline_count": {payload.get("display_count_label"): payload.get("display_count_value")}
+        if payload.get("display_count_label") else None,
+        "filters_used": payload.get("filters_used"),
+        "warnings": payload.get("warnings") or None,
+        "result_table_top_rows": (payload.get("important_table") or [])[:25] or None,
+    }
+    instruction = ""
+    if payload.get("intent") == "species_list":
+        instruction = ("The full species list is shown as a table under your answer, so summarize it: how many "
+                       "species/common names there are and which are most common. Do not list every species.")
+    if map_requested:
+        if map_available:
+            note = f"A map was created for {payload.get('coordinate_rows_in_result', 0)} matching rows with usable coordinates."
+            if payload.get("coordinate_kind") == "projected_crs_required" and selected_projected_crs:
+                note += f" Coordinates were converted from {selected_projected_crs} for display."
+            facts["map"] = note
+            instruction += " The map is shown under your answer; mention it briefly."
         else:
-            user_facing_payload["map_note"] = (
-                f"A map was created for {payload.get('coordinate_rows_in_result', 0)} matching rows with usable coordinates."
-            )
+            facts["map"] = {
+                "created": False,
+                "reason": payload.get("map_status_message") or "No usable coordinates were found.",
+                "rows_with_coordinates_in_dataset": payload.get("coordinate_rows_in_dataset"),
+                "coordinate_system_selected": selected_projected_crs,
+            }
+            instruction += (" No map could be made. Explain why in one sentence, say what the data would need "
+                            "(e.g. latitude/longitude columns, or X/Y columns with a known coordinate system), and "
+                            "offer a useful alternative from this dataset such as counts or a chart.")
+    facts = {k: v for k, v in facts.items() if v not in (None, "", [], {})}
 
-    if payload.get("map_requested"):
-        instruction = """
-Write a friendly, direct answer that starts with "Here’s your map."
-Then mention the key count and percent if available.
-Do not repeat the user's question.
-"""
-    else:
-        instruction = """
-Write a friendly, direct answer.
-Answer the user's question first, then briefly explain what the matched records mean.
-Mention the key count and percent if available.
-Do not repeat the user's question.
-"""
-
-    prompt = f"""
-Use only the verified facts below. Write 2 to 4 plain-English sentences.
-Do not invent facts. Do not recalculate numbers. Do not mention JSON or internal fields.
-If a map note is present, explain it in simple terms.
-If matching records are present, describe them as the answer to the question rather than merely saying records matched.
-If answer_subject is present, use that human phrase instead of internal filter wording.
-{instruction}
-
-Verified facts:
-{json.dumps(user_facing_payload, indent=2)}
-"""
-
-    text = safe_ollama_chat(
-        model_name,
-        prompt,
-        options={"temperature": 0.2, "num_predict": 220},
+    from grounded_answers import grounded_answer
+    text, _ = grounded_answer(
+        lambda model, messages, options=None: safe_ollama_chat(model, messages, options=options),
+        model_name, str(payload.get("question") or ""), facts, template,
+        dataset_context=st.session_state.get("active_dataset_context", ""), instruction=instruction,
     )
-
-    if not text:
-        if payload.get("map_requested"):
-            return "Here’s your map. " + payload["verified_summary"]
-        return payload["verified_summary"]
-
-    lowered = text.lower()
-
-    forbidden = [
-        "over 99%",
-        "almost all",
-        "forest surveyed",
-        "map_requested",
-        "json",
-        "coordinate information is not available",
-        "coordinates are not available",
-        "coordinate data is not available",
-    ]
-
-    if not payload.get("map_requested"):
-        forbidden.extend(["coordinate data", "coordinate rows", "missing coordinate"])
-
-    if any(term in lowered for term in forbidden):
-        if payload.get("map_requested"):
-            return "Here’s your map. " + payload["verified_summary"]
-        return payload["verified_summary"]
-
-    if payload.get("map_requested") and "map" not in lowered:
-        return "Here’s your map. " + text
-
     return text
 
 
@@ -3376,20 +3330,16 @@ def render_suggested_question_buttons(suggestions: List[str], key_prefix: str) -
     if st.session_state[show_more_key]:
         visible_suggestions = visible_suggestions + more_suggestions
 
-    st.caption("Suggested questions")
     selected_question = None
-    columns = st.columns(2)
-
-    for index, suggestion in enumerate(visible_suggestions):
-        with columns[index % 2]:
+    with st.sidebar.expander("Example questions", expanded=False):
+        for index, suggestion in enumerate(visible_suggestions):
             if st.button(suggestion, key=f"{key_prefix}::{index}", width="stretch"):
                 selected_question = suggestion
-
-    if more_suggestions:
-        toggle_label = "Show fewer questions ^" if st.session_state[show_more_key] else "More suggested questions v"
-        if st.button(toggle_label, key=f"{key_prefix}::toggle_more", width="stretch"):
-            st.session_state[show_more_key] = not st.session_state[show_more_key]
-            st.rerun()
+        if more_suggestions:
+            toggle_label = "Show fewer questions" if st.session_state[show_more_key] else "More questions"
+            if st.button(toggle_label, key=f"{key_prefix}::toggle_more", width="stretch"):
+                st.session_state[show_more_key] = not st.session_state[show_more_key]
+                st.rerun()
 
     return selected_question
 
@@ -3408,6 +3358,9 @@ def render_assistant_results(
 
         if result.get("type") == "general_chat":
             st.write(result["content"])
+            render_response_actions(dataset=csv_name, chat_id=active_chat_id, message_index=message_index,
+                                    part=result_index, question=str(result.get("question") or ""),
+                                    answer=str(result["content"]))
             continue
 
         instructions = result["instructions"]
@@ -3423,25 +3376,12 @@ def render_assistant_results(
         if extras_key not in st.session_state:
             st.session_state[extras_key] = False
 
-        answer_col, menu_col = st.columns([0.94, 0.06], vertical_alignment="center")
-
-        with answer_col:
-            st.write(explanation)
-
-        with menu_col:
-            menu_key = f"extras-menu::{csv_name}::{active_chat_id}::{message_index}::{result_index}"
-            checkbox_key = f"extras-checkbox::{csv_name}::{active_chat_id}::{message_index}::{result_index}"
-
-            if hasattr(st, "popover"):
-                with st.popover("...", help="Response options", width="stretch", key=menu_key):
-                    st.session_state[extras_key] = st.checkbox(
-                        "Show data result and developer details",
-                        value=st.session_state[extras_key],
-                        key=checkbox_key,
-                    )
-            elif st.button("...", key=menu_key, help="Show or hide data and developer details"):
-                st.session_state[extras_key] = not st.session_state[extras_key]
-                st.rerun()
+        st.write(explanation)
+        render_response_actions(
+            dataset=csv_name, chat_id=active_chat_id, message_index=message_index, part=result_index,
+            question=str(payload.get("question") or result.get("question") or ""),
+            answer=str(explanation), extras_key=extras_key,
+        )
 
         show_extras = st.session_state[extras_key]
 
@@ -3623,55 +3563,124 @@ if st.session_state.get("app_theme") not in THEME_PALETTES:
 
 apply_app_theme(st.session_state["app_theme"])
 
-st.title(APP_NAME)
-st.write("Ask questions across forestry, tree inventory, and spatial datasets. The app answers from the selected data and maps results when coordinates are usable.")
+apply_chat_shell()
+sidebar_chat_actions = st.sidebar.container(key="panda-chat-actions")
 
-with st.sidebar.popover("Import dataset", width="stretch"):
-    st.caption("Supported: CSV, GeoTIFF, TIFF, ERDAS IMG, GDAL VRT, and JPEG 2000.")
-    uploaded_dataset = st.file_uploader(
-        "Choose a dataset",
-        type=["csv", "tif", "tiff", "img", "vrt", "jp2"],
-        accept_multiple_files=False,
-        help="CSV files are stored in data. Raster files are stored in rasters.",
-    )
-    if st.button("Add dataset", disabled=uploaded_dataset is None, width="stretch"):
-        imported_path, import_error = save_uploaded_dataset(uploaded_dataset)
-        if import_error:
-            st.error(import_error)
-        elif imported_path is not None:
-            imported_kind = "CSV" if imported_path.suffix.lower() == ".csv" else "Raster"
-            st.session_state["dataset_selector"] = f"{imported_path.name} ({imported_kind})"
-            st.success(f"Imported `{imported_path.name}`.")
-            st.rerun()
-
-    st.caption("A VRT may reference other raster files; those referenced files must also be available to Canopy.")
-
-dataset_options = get_dataset_options()
-
-if not dataset_options:
-    st.error("No datasets found. Put CSV files in the data folder or raster files in the data or rasters folder.")
+library_items = get_library_items()
+if not library_items:
+    st.error("No datasets found. Add CSV or raster files to the library, or to the data or rasters folder.")
     st.stop()
 
-dataset_labels = [format_dataset_option(option) for option in dataset_options]
+dataset_labels = [format_dataset_option((item.kind, item.path)) for item in library_items]
+st.session_state["panda_dataset_labels"] = dataset_labels
 if st.session_state.get("dataset_selector") not in dataset_labels:
     st.session_state["dataset_selector"] = dataset_labels[0]
-selected_dataset_label = st.sidebar.selectbox(
-    "Dataset",
-    dataset_labels,
-    key="dataset_selector",
-)
-dataset_kind, dataset_path = dataset_options[dataset_labels.index(selected_dataset_label)]
 
-st.sidebar.segmented_control(
-    "Theme",
-    list(THEME_PALETTES),
-    selection_mode="single",
-    key="app_theme",
-    width="stretch",
-    help="Choose the interface palette used throughout the application.",
-)
+
+LIBRARY_KIND_ICONS = {"fvs": "forest", "csv": "table_chart", "raster": "satellite_alt"}
+
+
+@st.dialog("Dataset library", width="large")
+def render_dataset_library() -> None:
+    from html import escape as _esc
+
+    status = dataset_library.storage_status()
+    if status["persistent"] is False:
+        st.markdown(
+            '<div class="panda-lib-note warn"><span class="material-symbols-rounded">warning</span><div>'
+            f'<b>Uploads are temporary.</b> PANDA stores them at <code>{_esc(str(status["path"]))}</code>, which is '
+            'not on a persistent volume, so they and saved chats are lost on redeploy. '
+            'In Railway, attach a volume to this service at <code>/app/storage</code>.</div></div>',
+            unsafe_allow_html=True)
+    elif status["persistent"]:
+        st.markdown('<div class="panda-lib-note ok"><span class="material-symbols-rounded">cloud_done</span>'
+                    '<div>Uploads and chats are saved on the persistent volume.</div></div>', unsafe_allow_html=True)
+
+    search_col, filter_col = st.columns([3, 2], vertical_alignment="center")
+    query = search_col.text_input("Search the library", placeholder="Search datasets", label_visibility="collapsed",
+                                  key="library-search", icon=":material/search:")
+    kind_filter = filter_col.segmented_control("Type", ["All", "FVS", "CSV", "Raster"], default="All",
+                                               label_visibility="collapsed", key="library-filter",
+                                               width="stretch") or "All"
+    active = st.session_state.get("dataset_selector")
+    wanted = {"All": None, "FVS": "fvs", "CSV": "csv", "Raster": "raster"}[kind_filter]
+    shown = [(item, label) for item, label in zip(library_items, dataset_labels)
+             if (wanted is None or item.kind == wanted)
+             and (not query or query.lower() in (item.name + " " + item.kind_label).lower())]
+    st.markdown(f'<div class="panda-lib-count">{len(shown)} of {len(library_items)} datasets</div>',
+                unsafe_allow_html=True)
+    if not shown:
+        st.caption("No datasets match.")
+    for index, (item, label) in enumerate(shown):
+        is_active = label == active
+        with st.container(key=f"library-row-{index}{'-active' if is_active else ''}"):
+            info, actions = st.columns([6, 2], vertical_alignment="center", gap="small")
+            info.markdown(
+                f'<div class="panda-lib-item"><span class="panda-lib-icon {item.kind}">'
+                f'<span class="material-symbols-rounded">{LIBRARY_KIND_ICONS[item.kind]}</span></span>'
+                f'<div class="panda-lib-text"><div class="name" title="{_esc(item.name)}">{_esc(item.name)}</div>'
+                f'<div class="meta">{_esc(item.kind_label)} · {dataset_library.human_size(item.size_bytes)} · '
+                f'{_esc(item.source)} · added {item.added:%b %d, %Y}</div></div></div>',
+                unsafe_allow_html=True)
+            with actions:
+                if is_active:
+                    st.markdown('<div class="panda-lib-badge"><span></span>Analyzing</div>', unsafe_allow_html=True)
+                elif st.button("Analyze", key=f"library-pick-{index}", width="stretch"):
+                    st.session_state["dataset_selector"] = label
+                    st.rerun()
+                if item.source == "Uploaded":
+                    with st.popover("Delete", icon=":material/delete:", width="stretch"):
+                        st.caption(f"Delete `{item.name}` and its companion files? Saved chats are kept.")
+                        if st.button("Delete permanently", key=f"library-delete-{index}", type="primary"):
+                            try:
+                                dataset_library.delete_item(item)
+                                if is_active:
+                                    st.session_state.pop("dataset_selector", None)
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(str(exc))
+
+    with st.container(key="library-upload-section"):
+        st.markdown('<div class="panda-lib-section">Add datasets</div>'
+                    '<div class="panda-lib-help">CSV tables, rasters (GeoTIFF, IMG, VRT, JPEG 2000) and companion files. '
+                    'Upload an FVS CSV with its .shp, .shx and .dbf (same name) to enable stand maps.</div>',
+                    unsafe_allow_html=True)
+        uploads = st.file_uploader("Choose files", type=dataset_library.UPLOAD_TYPES, accept_multiple_files=True,
+                                   label_visibility="collapsed", key="library-upload")
+        if st.button("Add to library", disabled=not uploads, type="primary", icon=":material/add:"):
+            saved, errors = dataset_library.save_uploads(
+                [(f.name, f.getvalue()) for f in uploads], [item.name for item in library_items])
+            for error in errors:
+                st.error(error)
+            if saved:
+                first = saved[0]
+                kind = "fvs" if first.parent.name == "fvs" else ("raster" if first.suffix.lower() in RASTER_EXTENSIONS else "csv")
+                st.session_state["dataset_selector"] = format_dataset_option((kind, first))
+                if not errors:
+                    st.rerun()
+
+
+active_item = library_items[dataset_labels.index(st.session_state["dataset_selector"])]
+with st.sidebar.container(key="panda-active-dataset"):
+    from html import escape as _esc
+    st.markdown(f'<div class="panda-ds"><div class="label">Analyzing</div>'
+                f'<div class="name" title="{_esc(active_item.name)}">{_esc(active_item.name)}</div>'
+                f'<div class="kind">{_esc(active_item.kind_label)} · {_esc(active_item.source)}</div></div>',
+                unsafe_allow_html=True)
+    if st.button("Dataset library", icon=":material/folder_open:", width="stretch", key="open-library"):
+        render_dataset_library()
+dataset_kind, dataset_path = active_item.kind, active_item.path
+st.session_state["active_dataset_context"] = describe_dataset_for_model(dataset_kind, dataset_path)
+
+with st.sidebar.expander("Appearance & data", expanded=False):
+    st.segmented_control("Theme", list(THEME_PALETTES), selection_mode="single",
+                         key="app_theme", width="stretch")
+    st.toggle("Show dataset details", value=False, key="show_dataset_details")
 
 models = get_installed_ollama_models()
+with st.sidebar:
+    render_model_connection()
+render_usage_ring()
 question_preferred_order = ["qwen2.5:3b", "qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b"]
 schema_preferred_order = ["qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b", "qwen2.5:3b"]
 
@@ -3718,7 +3727,7 @@ if dataset_kind == "raster":
     raster_key = f"raster::{dataset_path.name}"
     chats_key, chats, active_chat_id = init_chat_state(raster_key)
 
-    if st.sidebar.button("New chat", width="stretch"):
+    if sidebar_chat_actions.button("New chat", width="stretch"):
         create_new_chat(raster_key)
         st.rerun()
 
@@ -3769,7 +3778,7 @@ if dataset_kind == "raster":
         if st.session_state.get("ollama_runtime"):
             st.caption(f"Model runtime: `{st.session_state['ollama_runtime']}`")
         if st.session_state.get("last_ollama_error"):
-            st.warning("The local model is unavailable; Canopy is using a fallback answer.")
+            st.warning("The local model is unavailable; PANDA is using a fallback answer.")
         st.caption("Data backend: raster metadata")
 
     raster_layer = get_raster_layer_for_path(dataset_path)
@@ -3780,108 +3789,113 @@ if dataset_kind == "raster":
             get_raster_companion_signature(dataset_path),
         )
 
-    st.subheader("Raster overview")
-    if raster_layer.get("rasterio_available"):
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Driver", raster_layer.get("driver", "Unknown"))
-        c2.metric("Bands", raster_layer.get("bands", "Unknown"))
-        c3.metric("Width", f"{raster_layer.get('width', 0):,}")
-        c4.metric("Height", f"{raster_layer.get('height', 0):,}")
-        st.info(summarize_raster_layer(raster_layer))
-    else:
-        st.warning(summarize_raster_layer(raster_layer))
+    if st.session_state.get("show_dataset_details", False):
+        st.subheader("Raster overview")
+        if raster_layer.get("rasterio_available"):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Driver", raster_layer.get("driver", "Unknown"))
+            c2.metric("Bands", raster_layer.get("bands", "Unknown"))
+            c3.metric("Width", f"{raster_layer.get('width', 0):,}")
+            c4.metric("Height", f"{raster_layer.get('height', 0):,}")
+            st.info(summarize_raster_layer(raster_layer))
+        else:
+            st.warning(summarize_raster_layer(raster_layer))
 
-    raster_table = pd.DataFrame([{
-        "Name": raster_layer.get("name"),
-        "Folder": raster_layer.get("folder"),
-        "Size MB": raster_layer.get("size_mb"),
-        "Driver": raster_layer.get("driver"),
-        "CRS": raster_layer.get("crs"),
-        "Width": raster_layer.get("width"),
-        "Height": raster_layer.get("height"),
-        "Bands": raster_layer.get("bands"),
-        "Bounds": raster_layer.get("bounds"),
-        "Geographic bounds": raster_layer.get("bounds_wgs84"),
-    }])
-    st.dataframe(raster_table, width="stretch", hide_index=True)
+        raster_table = pd.DataFrame([{
+            "Name": raster_layer.get("name"),
+            "Folder": raster_layer.get("folder"),
+            "Size MB": raster_layer.get("size_mb"),
+            "Driver": raster_layer.get("driver"),
+            "CRS": raster_layer.get("crs"),
+            "Width": raster_layer.get("width"),
+            "Height": raster_layer.get("height"),
+            "Bands": raster_layer.get("bands"),
+            "Bounds": raster_layer.get("bounds"),
+            "Geographic bounds": raster_layer.get("bounds_wgs84"),
+        }])
+        st.dataframe(raster_table, width="stretch", hide_index=True)
 
-    data_summary = raster_layer.get("data_summary", {})
-    if data_summary.get("valid_pixels"):
-        product_metadata = data_summary.get("product_metadata", {})
-        value_label = "TM_ID" if product_metadata.get("band_role") == "TM_ID" else "value"
-        st.write("Raster value summary")
-        s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Valid pixels", f"{data_summary['valid_pixels']:,}")
-        s2.metric("Distinct values", f"{data_summary['unique_values']:,}")
-        s3.metric(f"Minimum {value_label}", f"{data_summary['minimum']:,.0f}")
-        s4.metric(f"Maximum {value_label}", f"{data_summary['maximum']:,.0f}")
-        with st.expander("Most common mapped plot profiles", expanded=False):
-            st.dataframe(pd.DataFrame(data_summary["top_values"]), width="stretch", hide_index=True)
+        data_summary = raster_layer.get("data_summary", {})
+        if data_summary.get("valid_pixels"):
+            product_metadata = data_summary.get("product_metadata", {})
+            value_label = "TM_ID" if product_metadata.get("band_role") == "TM_ID" else "value"
+            st.write("Raster value summary")
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Valid pixels", f"{data_summary['valid_pixels']:,}")
+            s2.metric("Distinct values", f"{data_summary['unique_values']:,}")
+            s3.metric(f"Minimum {value_label}", f"{data_summary['minimum']:,.0f}")
+            s4.metric(f"Maximum {value_label}", f"{data_summary['maximum']:,.0f}")
+            with st.expander("Most common mapped plot profiles", expanded=False):
+                st.dataframe(pd.DataFrame(data_summary["top_values"]), width="stretch", hide_index=True)
+                if data_summary.get("attribute_rows"):
+                    st.caption(
+                        "Each pixel value is a TreeMap TM_ID. The accompanying raster attribute table supplies the "
+                        "linked forest type and structural attributes shown here."
+                    )
+                else:
+                    st.caption("These are numeric codes; no accompanying attribute table was found to interpret them.")
+
+            if data_summary.get("forest_type_summary"):
+                with st.expander("Mapped forest types", expanded=False):
+                    st.dataframe(
+                        pd.DataFrame(data_summary["forest_type_summary"]),
+                        width="stretch",
+                        height=360,
+                        hide_index=True,
+                    )
+                    st.caption(
+                        "Percentages are weighted by the number of 30 x 30 meter raster pixels assigned to each forest type."
+                    )
+
             if data_summary.get("attribute_rows"):
+                with st.expander("Raster attribute table", expanded=False):
+                    st.caption(
+                        f"{data_summary['attribute_rows']:,} modeled plot profiles from "
+                        f"`{Path(data_summary['companion_files']['attribute_table']).name}`."
+                    )
+                    st.dataframe(
+                        data_summary["attribute_table"],
+                        width="stretch",
+                        height=420,
+                        hide_index=True,
+                    )
+
+            if product_metadata:
+                with st.expander("Raster product documentation", expanded=False):
+                    if product_metadata.get("title"):
+                        st.write(product_metadata["title"])
+                    if product_metadata.get("value_definition"):
+                        st.write(f"**Pixel value:** {product_metadata['value_definition']}")
+                    if product_metadata.get("abstract"):
+                        st.write(product_metadata["abstract"])
+
+        raster_footprint_map = make_raster_footprint_map([raster_layer])
+        if raster_footprint_map is not None:
+            st.write("Raster data preview")
+            if data_summary.get("product_metadata", {}).get("band_role") == "TM_ID":
                 st.caption(
-                    "Each pixel value is a TreeMap TM_ID. The accompanying raster attribute table supplies the "
-                    "linked forest type and structural attributes shown here."
+                    "The colored layer shows the spatial pattern of TM_ID values. Colors distinguish identifier values "
+                    "for previewing the raster; they do not represent an ordered forest measurement."
                 )
             else:
-                st.caption("These are numeric codes; no accompanying attribute table was found to interpret them.")
-
-        if data_summary.get("forest_type_summary"):
-            with st.expander("Mapped forest types", expanded=False):
-                st.dataframe(
-                    pd.DataFrame(data_summary["forest_type_summary"]),
-                    width="stretch",
-                    height=360,
-                    hide_index=True,
-                )
-                st.caption(
-                    "Percentages are weighted by the number of 30 x 30 meter raster pixels assigned to each forest type."
-                )
-
-        if data_summary.get("attribute_rows"):
-            with st.expander("Raster attribute table", expanded=False):
-                st.caption(
-                    f"{data_summary['attribute_rows']:,} modeled plot profiles from "
-                    f"`{Path(data_summary['companion_files']['attribute_table']).name}`."
-                )
-                st.dataframe(
-                    data_summary["attribute_table"],
-                    width="stretch",
-                    height=420,
-                    hide_index=True,
-                )
-
-        if product_metadata:
-            with st.expander("Raster product documentation", expanded=False):
-                if product_metadata.get("title"):
-                    st.write(product_metadata["title"])
-                if product_metadata.get("value_definition"):
-                    st.write(f"**Pixel value:** {product_metadata['value_definition']}")
-                if product_metadata.get("abstract"):
-                    st.write(product_metadata["abstract"])
-
-    raster_footprint_map = make_raster_footprint_map([raster_layer])
-    if raster_footprint_map is not None:
-        st.write("Raster data preview")
-        if data_summary.get("product_metadata", {}).get("band_role") == "TM_ID":
-            st.caption(
-                "The colored layer shows the spatial pattern of TM_ID values. Colors distinguish identifier values "
-                "for previewing the raster; they do not represent an ordered forest measurement."
+                st.caption("The colored layer shows actual Band 1 pixel values using a display stretch; it is not a class legend.")
+            st_folium(
+                raster_footprint_map,
+                use_container_width=True,
+                height=500,
+                key=f"selected-raster-footprint::{dataset_path.name}",
             )
-        else:
-            st.caption("The colored layer shows actual Band 1 pixel values using a display stretch; it is not a class legend.")
-        st_folium(
-            raster_footprint_map,
-            use_container_width=True,
-            height=500,
-            key=f"selected-raster-footprint::{dataset_path.name}",
-        )
 
-    for message in messages:
+    for message_index, message in enumerate(messages):
         with st.chat_message(message["role"]):
             st.write(message["content"])
+            if message["role"] == "assistant":
+                render_response_actions(dataset=raster_key, chat_id=active_chat_id, message_index=message_index,
+                                        question=preceding_question(messages, message_index),
+                                        answer=message_text(message))
 
     suggested_prompt = st.session_state.pop(suggested_prompt_key, None)
-    prompt = st.chat_input("Ask about this raster dataset...")
+    prompt = chat_composer(messages, "raster-composer")
     active_prompt = suggested_prompt or prompt
 
     if active_prompt:
@@ -3903,19 +3917,22 @@ if dataset_kind == "raster":
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                answer = answer_raster_question(
-                    cleaned_prompt,
-                    raster_layer,
-                    model_name,
-                    use_model_explanation,
-                )
+                if not is_data_request(cleaned_prompt):
+                    answer = explain_general_chat(cleaned_prompt, model_name, use_model_explanation, messages)
+                else:
+                    answer = answer_raster_question(cleaned_prompt, raster_layer, model_name, use_model_explanation)
             st.write(answer)
+            render_response_actions(dataset=raster_key, chat_id=active_chat_id, message_index=len(messages),
+                                    question=cleaned_prompt, answer=str(answer))
 
         messages.append({
             "role": "assistant",
             "content": answer,
         })
         save_chat(raster_key, active_chat_id, st.session_state[chats_key][active_chat_id])
+
+    render_report_panel(messages, raster_key, active_chat_id,
+                        st.session_state[chats_key][active_chat_id]["title"], model_name, safe_ollama_chat)
 
     next_suggested_prompt = render_suggested_question_buttons(
         make_raster_suggested_questions(raster_layer),
@@ -3964,7 +3981,7 @@ selected_map_style = "Standard"
 
 chats_key, chats, active_chat_id = init_chat_state(csv_choice.name)
 
-if st.sidebar.button("New chat", width="stretch"):
+if sidebar_chat_actions.button("New chat", width="stretch"):
     create_new_chat(csv_choice.name)
     st.rerun()
 
@@ -4092,7 +4109,7 @@ with st.sidebar.expander("Advanced options", expanded=False):
     if st.session_state.get("ollama_runtime"):
         st.caption(f"Model runtime: `{st.session_state['ollama_runtime']}`")
     if st.session_state.get("last_ollama_error"):
-        st.warning("The local model is unavailable; Canopy is using deterministic interpretation or fallback text.")
+        st.warning("The local model is unavailable; PANDA is using deterministic interpretation or fallback text.")
     st.caption(f"Data backend: `{'SQLite' if st.session_state['use_sql_backend'] else 'pandas'}`")
 
     st.markdown("### Mapping")
@@ -4166,61 +4183,62 @@ with st.sidebar.expander("Advanced options", expanded=False):
         st.session_state["query_cache"] = {}
         st.success("Query cache cleared.")
 
-st.subheader("Dataset overview")
+if st.session_state.get("show_dataset_details", False):
+    st.subheader("Dataset overview")
 
-coordinate_label = get_coordinate_display_label(
-    schema.get("coordinate_kind", "none"),
-    selected_projected_crs,
-)
+    coordinate_label = get_coordinate_display_label(
+        schema.get("coordinate_kind", "none"),
+        selected_projected_crs,
+    )
 
-if coord_rows > 0:
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Rows", f"{len(df):,}")
-    c2.metric("Columns", len(df.columns))
-    c3.metric("Rows with coordinates", f"{coord_rows:,}")
-    c4.metric("Coordinate status", coordinate_label)
-else:
-    c1, c2 = st.columns(2)
-    c1.metric("Rows", f"{len(df):,}")
-    c2.metric("Columns", len(df.columns))
+    if coord_rows > 0:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Rows", f"{len(df):,}")
+        c2.metric("Columns", len(df.columns))
+        c3.metric("Rows with coordinates", f"{coord_rows:,}")
+        c4.metric("Coordinate status", coordinate_label)
+    else:
+        c1, c2 = st.columns(2)
+        c1.metric("Rows", f"{len(df):,}")
+        c2.metric("Columns", len(df.columns))
 
-coordinate_note = get_coordinate_note(schema.get("coordinate_kind", "none"), selected_projected_crs)
-if coordinate_note:
-    st.info(coordinate_note)
+    coordinate_note = get_coordinate_note(schema.get("coordinate_kind", "none"), selected_projected_crs)
+    if coordinate_note:
+        st.info(coordinate_note)
 
-with st.expander("Preview data"):
-    st.dataframe(df.head(25), width="stretch")
+    with st.expander("Preview data"):
+        st.dataframe(df.head(25), width="stretch")
 
-if use_sql_backend:
-    selected_sql_table = sync_dataframe_to_sqlite(csv_choice.name, df)
-    with st.expander("SQLite database preview", expanded=False):
-        database_size_mb = SQLITE_DB_PATH.stat().st_size / (1024 * 1024) if SQLITE_DB_PATH.exists() else 0
-        st.caption(
-            f"Database: `{SQLITE_DB_PATH}` | Size: {database_size_mb:,.2f} MB | "
-            f"Selected table: `{selected_sql_table}`"
-        )
-        tables_tab, data_tab, columns_tab = st.tabs(["Tables", "Selected data", "Columns"])
-
-        with tables_tab:
-            st.dataframe(get_sqlite_database_overview(), width="stretch", hide_index=True)
-
-        with data_tab:
-            st.code(
-                f"SELECT * FROM {quote_sql_identifier(selected_sql_table)} LIMIT 25",
-                language="sql",
+    if use_sql_backend:
+        selected_sql_table = sync_dataframe_to_sqlite(csv_choice.name, df)
+        with st.expander("SQLite database preview", expanded=False):
+            database_size_mb = SQLITE_DB_PATH.stat().st_size / (1024 * 1024) if SQLITE_DB_PATH.exists() else 0
+            st.caption(
+                f"Database: `{SQLITE_DB_PATH}` | Size: {database_size_mb:,.2f} MB | "
+                f"Selected table: `{selected_sql_table}`"
             )
-            st.dataframe(
-                preview_sqlite_table(selected_sql_table, 25),
-                width="stretch",
-                hide_index=True,
-            )
+            tables_tab, data_tab, columns_tab = st.tabs(["Tables", "Selected data", "Columns"])
 
-        with columns_tab:
-            st.dataframe(
-                get_sqlite_table_columns(selected_sql_table),
-                width="stretch",
-                hide_index=True,
-            )
+            with tables_tab:
+                st.dataframe(get_sqlite_database_overview(), width="stretch", hide_index=True)
+
+            with data_tab:
+                st.code(
+                    f"SELECT * FROM {quote_sql_identifier(selected_sql_table)} LIMIT 25",
+                    language="sql",
+                )
+                st.dataframe(
+                    preview_sqlite_table(selected_sql_table, 25),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+            with columns_tab:
+                st.dataframe(
+                    get_sqlite_table_columns(selected_sql_table),
+                    width="stretch",
+                    hide_index=True,
+                )
 
 
 def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
@@ -4237,7 +4255,7 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
         if route == "general_chat":
             computed_results.append({
                 "type": "general_chat",
-                "content": explain_general_chat(question, model_name, use_model_explanation),
+                "content": explain_general_chat(question, model_name, use_model_explanation, messages),
             })
             continue
 
@@ -4275,7 +4293,7 @@ def compute_results_for_query(query_text: str) -> List[Dict[str, Any]]:
                     schema,
                     instructions,
                 )
-                warnings.append(f"SQLite query failed, so Canopy used the pandas fallback for this answer: {exc}")
+                warnings.append(f"SQLite query failed, so PANDA used the pandas fallback for this answer: {exc}")
                 data_backend = "pandas fallback"
                 sql_text = None
                 sql_params = []
@@ -4361,6 +4379,11 @@ for message_index, message in enumerate(messages):
         else:
             if message.get("content"):
                 st.write(message["content"])
+                if not message.get("results"):
+                    render_response_actions(dataset=csv_choice.name, chat_id=active_chat_id,
+                                            message_index=message_index,
+                                            question=preceding_question(messages, message_index),
+                                            answer=message_text(message))
 
             if message.get("results"):
                 render_assistant_results(
@@ -4395,7 +4418,7 @@ if not refine_running and pending_schema_question_key in st.session_state:
     save_chat(csv_choice.name, active_chat_id, st.session_state[chats_key][active_chat_id])
 
 suggested_prompt = st.session_state.pop(suggested_prompt_key, None)
-prompt = st.chat_input("Ask about your forestry or spatial data...")
+prompt = chat_composer(messages, "csv-composer")
 
 active_prompt = suggested_prompt or prompt
 
@@ -4450,6 +4473,9 @@ if active_prompt:
             "results": results,
         })
         save_chat(csv_choice.name, active_chat_id, st.session_state[chats_key][active_chat_id])
+
+render_report_panel(messages, csv_choice.name, active_chat_id,
+                    st.session_state[chats_key][active_chat_id]["title"], model_name, safe_ollama_chat)
 
 next_suggested_prompt = render_suggested_question_buttons(
     make_suggested_questions(df, schema, coord_rows),

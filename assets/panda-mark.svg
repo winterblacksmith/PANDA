@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 280" role="img" aria-labelledby="panda-title">
+  <title id="panda-title">PANDA — PERSEUS AI for Natural-language Data Analysis</title>
+  <defs><path id="panda-arc" d="M120 18 A102 102 0 1 1 120 222 A102 102 0 1 1 120 18"/></defs>
+  <style>
+    .panda-orbit {transform-origin:120px 120px;animation:panda-orbit-spin 40s linear infinite;}
+    @keyframes panda-orbit-spin {from {transform:rotate(0deg);} to {transform:rotate(360deg);}}
+    @media (prefers-reduced-motion:reduce) {.panda-orbit {animation:none;}}
+  </style>
+  <g class="panda-orbit" fill="currentColor" aria-hidden="true">
+    <text font-family="Arial, sans-serif" font-size="12" letter-spacing="1.1"><textPath href="#panda-arc" startOffset="0">PERSEUS AI for Natural-language Data Analysis</textPath></text>
+  </g>
+  <text fill="currentColor" x="120" y="263" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="600" letter-spacing="5" aria-hidden="true">PANDA</text>
+  <g fill="currentColor">
+    <!-- Three flat-ended internodes, separated by clear node gaps. -->
+    <path d="M115 65 Q111 65 111 70 Q115 86 111 103 Q111 107 115 107 H130 Q134 107 134 103 Q130 86 134 70 Q134 65 130 65 Z"/>
+    <path d="M115 113 Q111 113 111 118 Q115 134 111 151 Q111 155 115 155 H130 Q134 155 134 151 Q130 134 134 118 Q134 113 130 113 Z"/>
+    <path d="M115 161 Q111 161 111 165 Q114 177 111 189 Q111 193 115 193 H130 Q134 193 134 189 Q131 177 134 165 Q134 161 130 161 Z"/>
+    <!-- Detached lance-shaped leaves: no stems crossing the stalk. -->
+    <path d="M140 92 Q145 65 173 51 Q166 78 140 92 Z"/>
+    <path d="M102 140 Q78 125 76 98 Q98 114 102 140 Z"/>
+    <path d="M101 150 Q74 153 58 132 Q84 131 101 150 Z"/>
+  </g>
+</svg>

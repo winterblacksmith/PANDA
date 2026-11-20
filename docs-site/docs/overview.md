@@ -4,6 +4,8 @@ title: 1. Canopy overview
 slug: /overview
 description: Purpose, repository, local language model, and data flow for Canopy.
 sidebar_position: 1
+last_update:
+  date: 2026-08-20
 ---
 
 # 1. Canopy overview

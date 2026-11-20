@@ -49,5 +49,7 @@ def render_fvs_drive_mode(app: Dict[str, Any], dataset_path: Path) -> None:
         get_chat_storage_summary=get_chat_storage_summary,
         normalize_prompt=app["normalize_prompt"],
         safe_ollama_chat=app["safe_ollama_chat"],
+        explain_general_chat=app["explain_general_chat"],
         render_suggested_question_buttons=app["render_suggested_question_buttons"],
+        sidebar_chat_actions=app["sidebar_chat_actions"],
     )

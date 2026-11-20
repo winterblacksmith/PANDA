@@ -4,6 +4,8 @@ title: 2. Implementation walkthrough
 slug: /implementation-walkthrough
 description: A supervisor-ready explanation of how Canopy evolved from CSV and JSON files into a local SQL and spatial-data knowledge base.
 sidebar_position: 2
+last_update:
+  date: 2026-08-20
 ---
 
 # 2. Implementation walkthrough

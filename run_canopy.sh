@@ -46,5 +46,5 @@ if ! "$OLLAMA_BIN" list | grep '^qwen2.5:3b' >/dev/null; then
     exit 1
 fi
 
-echo "Ollama and qwen2.5:3b are ready. Starting Canopy from $SCRIPT_DIR"
+echo "Ollama and qwen2.5:3b are ready. Starting PANDA from $SCRIPT_DIR"
 exec "$STREAMLIT_BIN" run app.py --server.address 127.0.0.1 --server.port 8501

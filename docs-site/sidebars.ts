@@ -12,12 +12,12 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Data',
-      items: ['data/fvs-treemap'],
+      items: ['data/fvs-treemap', 'data/dataset-library'],
     },
     {
       type: 'category',
       label: 'Architecture',
-      items: ['architecture/sql-chat'],
+      items: ['architecture/sql-chat', 'architecture/irene-inference-gateway', 'architecture/model-providers'],
     },
   ],
 };

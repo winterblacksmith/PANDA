@@ -1,4 +1,4 @@
-"""FVS stand-result querying and spatial visualization for Canopy.
+"""FVS stand-result querying and spatial visualization for PANDA.
 
 The FVS CSV is the queryable attribute table, MU_ID identifies stand polygons in
 the accompanying shapefile, and TM_Value links records to TreeMap raster cells.

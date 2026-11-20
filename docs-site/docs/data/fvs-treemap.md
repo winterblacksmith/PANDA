@@ -2,6 +2,8 @@
 id: fvs-treemap
 title: FVS stands and TreeMap raster
 description: Schema, joins, examples, and limitations of the FVS and TreeMap integration.
+last_update:
+  date: 2026-08-20
 ---
 
 # FVS stands and TreeMap raster

@@ -1,0 +1,57 @@
+name: panda-local-llm
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - inference
+      - egress
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  model-init:
+    image: ollama/ollama:latest
+    restart: "no"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ["pull", "${PANDA_OLLAMA_MODEL:-qwen2.5:3b}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - inference
+
+  gateway:
+    build:
+      context: .
+      dockerfile: inference_gateway/Dockerfile
+    restart: unless-stopped
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      PANDA_ALLOWED_MODELS: ${PANDA_OLLAMA_MODEL:-qwen2.5:3b}
+      PANDA_INFERENCE_TOKEN: ${PANDA_INFERENCE_TOKEN:?Set PANDA_INFERENCE_TOKEN in .env.local-llm}
+    ports:
+      - "127.0.0.1:${PANDA_GATEWAY_PORT:-8000}:8000"
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+    networks:
+      - inference
+      - edge
+
+volumes:
+  ollama-data:
+
+networks:
+  inference:
+    internal: true
+  egress:
+  edge:

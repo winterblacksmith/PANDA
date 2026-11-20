@@ -1,0 +1,6 @@
+[client]
+# Hide developer-only toolbar items (e.g. Deploy) so the top-right tools have room.
+toolbarMode = "minimal"
+
+[theme]
+primaryColor = "#5CC285"

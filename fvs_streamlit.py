@@ -1,4 +1,4 @@
-"""Streamlit presentation layer for Canopy's FVS integration."""
+"""Streamlit presentation layer for PANDA's FVS integration."""
 
 from __future__ import annotations
 
@@ -10,6 +10,10 @@ import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
 from safe_streamlit_render import render_html_bar_chart, render_html_table
+from report_ui import render_report_panel
+from response_actions import message_text, preceding_question, render_response_actions
+from conversation import is_data_request
+from chat_shell import chat_composer
 
 from fvs_integration import (
     DISPLAY_COLUMNS,
@@ -43,21 +47,42 @@ def _explain(
     use_model: bool,
     safe_ollama_chat: Callable[..., str],
 ) -> str:
-    verified_summary = summarize_fvs_result(result_df, spec)
-    if result_df.empty or not use_model:
-        return verified_summary
-    prompt = f"""
-You are Canopy, a local forestry data assistant. Use only the verified facts below.
-Question: {question}
-Applied filters: {format_fvs_filters(spec)}
-Verified result: {verified_summary}
-Composition counts: {json.dumps(result_df['COMPOSITIO'].value_counts().to_dict())}
+    """Model-written answer grounded in the FVS SQL result (template only when AI is off/unreachable)."""
+    from grounded_answers import grounded_answer
 
-Answer in 2-4 clear sentences. Do not invent causes, units, trends, or model assumptions.
-Mention that the figures come from the local FVS stand-results table when useful.
-"""
-    answer = safe_ollama_chat(model_name, prompt, options={"temperature": 0.1})
-    return answer or verified_summary
+    verified_summary = summarize_fvs_result(result_df, spec)
+    if not use_model:
+        return verified_summary
+    facts: Dict[str, Any] = {
+        "source": "PANDA's FVS stand-results table (SQLite query)",
+        "filters_applied": format_fvs_filters(spec),
+        "verified_summary": verified_summary,
+        "matching_stands": int(len(result_df)),
+    }
+    if not result_df.empty:
+        facts.update({
+            "total_acres": round(float(result_df["Acres"].sum()), 1),
+            "mean_age_years": round(float(result_df["Age"].mean()), 1),
+            "estimated_total_volume_cu_ft (TCuFt x Acres)": round(float((result_df["TCuFt"] * result_df["Acres"]).sum())),
+            "stands_by_composition": result_df["COMPOSITIO"].value_counts().to_dict(),
+        })
+        if spec.get("intent") == "chart":
+            group = spec.get("chart_group") or "Age"
+            if group in result_df.columns:
+                facts[f"acres_by_{group}"] = (result_df.groupby(group)["Acres"].sum().round(1)
+                                              .sort_index().head(40).to_dict())
+    instruction = ("Stand counts, acres, ages and volumes come from the FVS stand table. Simulated ages are "
+                   "biased toward a handful of FIA plots, so avoid strong claims about real age structure.")
+    if spec.get("make_map") or spec.get("make_raster"):
+        instruction += " A stand map is shown under your answer when stands matched; mention it briefly."
+    if result_df.empty:
+        instruction += " No stands matched: say so and suggest a looser filter."
+    text, _ = grounded_answer(
+        lambda model, messages, options=None: safe_ollama_chat(model, messages, options=options),
+        model_name, question, facts, verified_summary,
+        dataset_context=st.session_state.get("active_dataset_context", ""), instruction=instruction,
+    )
+    return text
 
 
 def _render_result(
@@ -159,6 +184,8 @@ def render_fvs_mode(
     normalize_prompt: Callable[[str], str],
     safe_ollama_chat: Callable[..., str],
     render_suggested_question_buttons: Callable[..., Optional[str]],
+    explain_general_chat: Callable[..., str],
+    sidebar_chat_actions=None,
 ) -> None:
     fvs_df = load_csv(csv_path)
     dataset_key = f"fvs::{csv_path.name}"
@@ -166,7 +193,7 @@ def render_fvs_mode(
     table_name = sync_dataframe_to_sqlite(source_key, fvs_df)
     chats_key, chats, active_chat_id = init_chat_state(dataset_key)
 
-    if st.sidebar.button("New chat", width="stretch", key="new_fvs_chat"):
+    if (sidebar_chat_actions or st.sidebar).button("New chat", width="stretch", key="new_fvs_chat"):
         create_new_chat(dataset_key)
         st.rerun()
     if st.sidebar.button("Clear current chat", width="stretch", key="clear_fvs_chat"):
@@ -182,7 +209,7 @@ def render_fvs_mode(
         chat_ids,
         index=active_index,
         format_func=lambda chat_id: chats[chat_id]["title"],
-        key="fvs_chat_history",
+        key=f"fvs_chat_history::{active_chat_id}",
     )
     if selected_chat_id != st.session_state[f"active_chat::{dataset_key}"]:
         st.session_state[f"active_chat::{dataset_key}"] = selected_chat_id
@@ -194,34 +221,39 @@ def render_fvs_mode(
     chat_count, message_count = get_chat_storage_summary(dataset_key)
     st.sidebar.caption(f"Saved in SQLite: {chat_count:,} chat(s), {message_count:,} message(s)")
     with st.sidebar.expander("FVS settings", expanded=False):
+        enabled = st.checkbox("Use model answers", value=use_model_explanation, key="fvs_model_answers")
+        if enabled != use_model_explanation:
+            st.session_state["use_model_explanation"] = enabled
+            st.rerun()
         st.caption(f"Local answer model: `{model_name}`")
         st.caption("Filtering backend: `SQLite` (parameterized)")
         st.caption("Geometry join: `MU_ID`")
         st.caption("TreeMap raster join: `TM_Value`")
 
-    st.subheader("FVS stand simulation results")
-    overview = st.columns(4)
-    overview[0].metric("Stands", f"{len(fvs_df):,}")
-    overview[1].metric("Unique MU_ID", f"{fvs_df['MU_ID'].nunique():,}")
-    overview[2].metric("Total acres", f"{fvs_df['Acres'].sum():,.1f}")
-    overview[3].metric("TreeMap profiles", f"{fvs_df['TM_Value'].nunique():,}")
-    st.info(
-        "Each SQLite row is one FVS stand. `MU_ID` selects its shapefile polygon; `TM_Value` selects "
-        "the linked TreeMap raster cells. The raster attribute DBF explains the TreeMap plot profiles."
-    )
+    if st.session_state.get("show_dataset_details", False):
+        st.subheader("FVS stand simulation results")
+        overview = st.columns(4)
+        overview[0].metric("Stands", f"{len(fvs_df):,}")
+        overview[1].metric("Unique MU_ID", f"{fvs_df['MU_ID'].nunique():,}")
+        overview[2].metric("Total acres", f"{fvs_df['Acres'].sum():,.1f}")
+        overview[3].metric("TreeMap profiles", f"{fvs_df['TM_Value'].nunique():,}")
+        st.info(
+            "Each SQLite row is one FVS stand. `MU_ID` selects its shapefile polygon; `TM_Value` selects "
+            "the linked TreeMap raster cells. The raster attribute DBF explains the TreeMap plot profiles."
+        )
 
-    bundle = fvs_bundle_paths(csv_path)
-    with st.expander("Dataset package and SQL proof", expanded=False):
-        st.write(f"Source CSV: `{csv_path.resolve()}`")
-        st.write(f"SQLite database: `{database_path.resolve()}`")
-        st.write(f"SQLite table: `{table_name}`")
-        st.write(f"Synchronized rows: `{len(fvs_df):,}`")
-        st.write("Shapefile package")
-        st.json({key: str(path.resolve()) for key, path in bundle.items() if key != "csv"})
-        raster_path = _preferred_raster(raster_dir)
-        if raster_path is not None:
-            st.write("TreeMap raster package")
-            st.json([str(path.resolve()) for path in sorted(raster_path.parent.glob("TreeMap_2022.*"))])
+        bundle = fvs_bundle_paths(csv_path)
+        with st.expander("Dataset package and SQL proof", expanded=False):
+            st.write(f"Source CSV: `{csv_path.resolve()}`")
+            st.write(f"SQLite database: `{database_path.resolve()}`")
+            st.write(f"SQLite table: `{table_name}`")
+            st.write(f"Synchronized rows: `{len(fvs_df):,}`")
+            st.write("Shapefile package")
+            st.json({key: str(path.resolve()) for key, path in bundle.items() if key != "csv"})
+            raster_path = _preferred_raster(raster_dir)
+            if raster_path is not None:
+                st.write("TreeMap raster package")
+                st.json([str(path.resolve()) for path in sorted(raster_path.parent.glob("TreeMap_2022.*"))])
 
     for message_index, message in enumerate(messages):
         with st.chat_message(message["role"]):
@@ -236,9 +268,12 @@ def render_fvs_mode(
                             result, csv_path, database_path, raster_dir, table_name,
                             active_chat_id, message_index,
                         )
+                render_response_actions(dataset=dataset_key, chat_id=active_chat_id, message_index=message_index,
+                                        question=preceding_question(messages, message_index),
+                                        answer=message_text(message))
 
     suggested_prompt = st.session_state.pop(suggested_key, None)
-    prompt = st.chat_input("Ask about FVS stands, charts, polygons, or the TreeMap raster...")
+    prompt = chat_composer(messages, "fvs-composer")
     active_prompt = suggested_prompt or prompt
     if active_prompt:
         cleaned_prompt = normalize_prompt(active_prompt)
@@ -252,30 +287,42 @@ def render_fvs_mode(
         with st.chat_message("user"):
             st.write(cleaned_prompt)
         with st.chat_message("assistant"):
-            with st.spinner("Querying local FVS data..."):
-                spec = parse_fvs_question(cleaned_prompt)
-                filtered_df, sql_text, sql_parameters = execute_fvs_sql(
-                    database_path, table_name, spec
-                )
-                content = _explain(
-                    cleaned_prompt, filtered_df, spec, model_name,
-                    use_model_explanation, safe_ollama_chat,
-                )
-                result = {
-                    "type": "fvs_query",
-                    "question": cleaned_prompt,
-                    "spec": spec,
-                    "content": content,
-                    "data_backend": "SQLite",
-                    "sql_query": sql_text,
-                    "sql_parameters": sql_parameters,
-                }
-                _render_result(
-                    result, csv_path, database_path, raster_dir, table_name,
-                    active_chat_id, len(messages),
-                )
-        messages.append({"role": "assistant", "results": [result]})
+            if not is_data_request(cleaned_prompt):
+                with st.spinner("Thinking..."):
+                    content = explain_general_chat(cleaned_prompt, model_name, use_model_explanation, messages)
+                st.write(content)
+                messages.append({"role": "assistant", "content": content})
+            else:
+                with st.spinner("Querying local FVS data..."):
+                    spec = parse_fvs_question(cleaned_prompt)
+                    filtered_df, sql_text, sql_parameters = execute_fvs_sql(
+                        database_path, table_name, spec
+                    )
+                    content = _explain(
+                        cleaned_prompt, filtered_df, spec, model_name,
+                        use_model_explanation, safe_ollama_chat,
+                    )
+                    result = {
+                        "type": "fvs_query",
+                        "question": cleaned_prompt,
+                        "spec": spec,
+                        "content": content,
+                        "verified_summary": summarize_fvs_result(filtered_df, spec),
+                        "data_backend": "SQLite",
+                        "sql_query": sql_text,
+                        "sql_parameters": sql_parameters,
+                    }
+                    _render_result(
+                        result, csv_path, database_path, raster_dir, table_name,
+                        active_chat_id, len(messages),
+                    )
+                messages.append({"role": "assistant", "results": [result]})
+            render_response_actions(dataset=dataset_key, chat_id=active_chat_id, message_index=len(messages) - 1,
+                                    question=cleaned_prompt, answer=message_text(messages[-1]))
         persist_current_chat(dataset_key, chats_key, active_chat_id)
+
+    render_report_panel(messages, dataset_key, active_chat_id,
+                        st.session_state[chats_key][active_chat_id]["title"], model_name, safe_ollama_chat)
 
     suggestions = [
         "Chart the sum of acres by age",
