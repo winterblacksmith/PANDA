@@ -3545,7 +3545,7 @@ def render_assistant_results(
 # Streamlit UI
 # -----------------------------
 
-st.set_page_config(page_title=APP_NAME, layout="wide")
+st.set_page_config(page_title=APP_NAME, page_icon=str(Path(__file__).parent / "assets" / "panda-favicon.png"), layout="wide")
 
 if st.session_state.get("app_state_version") != APP_STATE_VERSION:
     for key in list(st.session_state.keys()):
