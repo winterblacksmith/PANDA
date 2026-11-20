@@ -600,3 +600,38 @@ PANDA, and for every document to show when it was last updated.
   page now has `last_update` front matter (dates from git history) and
   `showLastUpdateTime` is enabled; README and this worklog carry a dated header.
 - Tests: 44 passed (5 new usage tests incl. no text/keys in the usage DB).
+
+## 2026-11-20: v1.1 — dataset library, dataset-aware chat, PDF fixes, UI refresh
+
+From the user's staging test (two PDF reports and screenshots):
+
+- Model could not "see" the dataset: general-chat prompts carried no dataset
+  information, so the model asked the user to confirm columns (Acres, TCuFt,
+  Age) that PANDA had just queried. `app.describe_dataset_for_model` now builds
+  a cached profile (rows, columns, types, ranges, top values, FVS tool list; no
+  raw rows) passed via `conversation.chat_messages(dataset_context=...)` with
+  rules not to ask about listed columns. Routing (`is_data_request`) now sends
+  "analyze that data", "age class breakdown", "volume per acre", "spatial"
+  requests to the verified tools.
+- PDF: narrow/no-break spaces (U+202F etc.) rendered as "[U+202F]"; now mapped
+  to spaces. Markdown tables/bullets/headings/rules are rendered properly.
+  "Summary model" now names the provider that wrote the summary (was the local
+  model name). Messages labelled "You" / "PANDA".
+- Storage: chats were in `PANDA_STORAGE_DIR/canopy.sqlite` but uploads went to
+  the image's `data/` folder (lost on redeploy). New `dataset_library.py`
+  stores uploads under `PANDA_STORAGE_DIR/library/`, groups companion files,
+  supports FVS CSV + shapefile uploads, deletes uploaded items only, and
+  detects whether storage is on a Railway volume (`RAILWAY_VOLUME_MOUNT_PATH`).
+  Library dialog replaces the Import popover and dataset dropdown.
+- UI: darker Forest theme (text contrast 17.8:1 on background, 16.6:1 on
+  sidebar); wordmark top-centered; white New chat button; rounded floating
+  prompt bar with centered text and high-contrast send button; user/assistant
+  avatars restored, user turns as bubbles; usage ring (hover card) and report
+  download circle top-right; themed popovers/dialogs; version "PANDA v1.1"
+  bottom-right (`version.py`). Light theme checked for contrast.
+- Dockerfile: `STREAMLIT_CLIENT_TOOLBAR_MODE=minimal`, theme primary colour.
+- Docs: new `docs-site/docs/data/dataset-library.md`; model-providers page and
+  README updated; all with last-updated dates.
+- Verification: 52 tests passed; app rendered locally and screenshotted in
+  Forest and Light themes (welcome, chat, report menu, library dialog). Not yet
+  verified on Railway.

@@ -57,14 +57,18 @@ counts against the output cap. PANDA therefore sends `reasoning_effort=low` and
 allows at least 2,048 output tokens. A small cap produced empty answers in the
 first staging test on 2026-11-20.
 
-## Usage panel
+## Usage indicator
 
-The sidebar's **Model usage today** panel shows, per provider:
+The circle in the top-right corner shows how much of today's tightest quota is
+used (green under 60%, amber under 85%, red above). Hover over it, or focus it
+with the keyboard, to see per provider:
 
 - requests used today, the daily limit, and how many are left;
 - tokens used today, the daily token limit, and how many are left;
 - for Groq, the live per-minute token allowance;
-- the token count of the most recent answer (input and output).
+- the token count of the most recent answer.
+
+The download circle next to it opens the conversation report menu (PDF).
 
 | Provider | Requests: used / left | Tokens: used / left |
 | --- | --- | --- |

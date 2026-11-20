@@ -16,14 +16,11 @@ def test_geotiff_is_available_and_opens_from_dataset_selector():
     assert theme_selector.label == "Theme"
     assert theme_selector.value == "Forest"
     assert list(theme_selector.options) == ["Light", "Dark", "Forest"]
-    dataset_selector = app.sidebar.selectbox[0]
-    assert any("TreeMap_2022.tif" in str(option) for option in dataset_selector.options)
-
-    raster_index = next(
-        index for index, option in enumerate(dataset_selector.options)
-        if "TreeMap_2022.tif" in str(option)
-    )
-    app = dataset_selector.select_index(raster_index).run()
+    # Datasets are chosen from the library dialog; the active choice lives in session state.
+    assert any(button.label == "Dataset library" for button in app.sidebar.button)
+    raster_label = next(label for label in app.session_state["panda_dataset_labels"] if "TreeMap_2022.tif" in label)
+    app.session_state["dataset_selector"] = raster_label
+    app = app.run()
 
     assert not app.exception
     assert any("Raster overview" in heading.value for heading in app.subheader)

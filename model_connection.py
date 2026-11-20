@@ -157,3 +157,74 @@ def render_model_usage():
                                       for m in row["models"]))
         st.caption(f"Day {data['day']} (Pacific). Daily quotas reset at midnight Pacific / 3 AM Eastern. "
                    "Exact account limits: console.groq.com/settings/limits and aistudio.google.com/rate-limit.")
+
+
+def _ring_color(fraction):
+    if fraction >= 0.85:
+        return "#F07167"
+    if fraction >= 0.6:
+        return "#F2C14E"
+    return "#5CC285"
+
+
+def usage_ring_html(rows, last=None):
+    """Circle showing the highest share of today's quota used; hover/focus reveals exact numbers."""
+    from html import escape as esc
+
+    fractions = []
+    sections = []
+    for row in rows:
+        name = row["provider"]
+        label = esc(provider_label(name))
+        if name == "local":
+            sections.append(f'<div class="prov">{label}</div>'
+                            f'<div class="row"><span>Requests</span><b>{_fmt(row["requests_used"])}</b></div>'
+                            f'<div class="row"><span>Tokens</span><b>{_fmt(row["tokens_used"])}</b></div>'
+                            '<div class="row"><span>Limit</span><b>none (self-hosted)</b></div>')
+            continue
+        live = row["live"]
+        req_used = (row["requests_limit"] - (row["requests_remaining"] or 0)) if live else row["requests_used"]
+        parts = [f'<div class="prov">{label}</div>']
+        for title, used, limit, left in (("Requests", req_used, row["requests_limit"], row["requests_remaining"]),
+                                         ("Tokens", row["tokens_used"], row["tokens_limit"], row["tokens_remaining"])):
+            if limit:
+                frac = min(1.0, used / limit)
+                fractions.append(frac)
+                left = left if left is not None else max(0, limit - used)
+                parts.append(f'<div class="row"><span>{title}</span><b>{_fmt(used)} / {_fmt(limit)}</b></div>'
+                             f'<div class="bar"><span style="width:{frac * 100:.1f}%;background:{_ring_color(frac)}"></span></div>'
+                             f'<div class="row"><span></span><span>{_fmt(left)} left</span></div>')
+            else:
+                parts.append(f'<div class="row"><span>{title}</span><b>{_fmt(used)}</b></div>')
+        if live and live.get("limit_tokens"):
+            parts.append(f'<div class="row"><span>This minute</span><b>{_fmt(live["remaining_tokens"])} / '
+                         f'{_fmt(live["limit_tokens"])} tokens left</b></div>')
+        parts.append('<div class="row"><span>Source</span><span>' +
+                     ("live from Groq" if live else "counted by PANDA") + '</span></div>')
+        sections.append("".join(parts))
+    peak = max(fractions) if fractions else 0.0
+    circumference = 2 * 3.14159 * 13
+    dash = circumference * peak
+    last_line = ""
+    if last:
+        last_line = (f'<div class="row" style="margin-top:6px"><span>Last answer</span><b>{_fmt(last.get("total_tokens", 0))} tokens</b></div>'
+                     f'<div class="row"><span></span><span>{esc(str(last.get("label", "")))}</span></div>')
+    card = ('<div class="panda-usage-card" role="tooltip"><h4>Model usage today</h4>' + last_line + "".join(sections) +
+            '<div class="foot">Daily quotas reset at midnight Pacific (3 AM Eastern).</div></div>')
+    svg = ('<svg viewBox="0 0 32 32" aria-hidden="true">'
+           '<circle cx="16" cy="16" r="13" fill="none" stroke="rgba(255,255,255,.12)" stroke-width="3.2"/>'
+           f'<circle cx="16" cy="16" r="13" fill="none" stroke="{_ring_color(peak)}" stroke-width="3.2" '
+           f'stroke-linecap="round" stroke-dasharray="{dash:.2f} {circumference:.2f}"/></svg>')
+    pct = f"{peak * 100:.0f}%" if fractions else "–"
+    return (f'<div class="panda-usage" tabindex="0" aria-label="Model usage today: {pct} of the tightest daily limit used">'
+            f'{svg}<span class="pct">{pct}</span>{card}</div>')
+
+
+def render_usage_ring():
+    try:
+        chain = provider_chain()
+    except LLMConnectionError:
+        chain = []
+    data = llm_usage.provider_rows(providers=chain or None)
+    with st.container(key="panda-topbar-usage"):
+        st.markdown(usage_ring_html(data["rows"], st.session_state.get("last_llm_usage")), unsafe_allow_html=True)

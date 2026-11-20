@@ -28,3 +28,24 @@ def test_context_is_recent_role_aware_and_does_not_duplicate_current_turn():
     assert "12 stands" in str(messages)
     assert "secret rows" not in str(messages)
     assert len(chat_messages("new", history, max_chars=3)) == 2
+
+
+def test_dataset_context_is_given_to_the_model_with_rules():
+    from conversation import chat_messages
+    context = "Name: stands.csv\nColumns (3):\n- Acres (number)\n- Age (number)\n- TCuFt (number)"
+    messages = chat_messages("do the volume per acre", [], dataset_context=context)
+    system = messages[0]["content"]
+    assert "<selected_dataset>" in system and "TCuFt" in system
+    assert "never ask the user to confirm whether these columns exist" in system
+    assert "<selected_dataset>" not in chat_messages("hi", [])[0]["content"]
+
+
+def test_analysis_requests_route_to_data_tools():
+    from conversation import is_data_request
+    for prompt in ("ok analyze that data for me",
+                   "do the volume per acre, age class breakdown, and spatial pattern",
+                   "show the age distribution of stands"):
+        assert is_data_request(prompt), prompt
+    for prompt in ("hi there", "who are you and what do you do?", "what is volume per acre?",
+                   "explain age class breakdown", "give me a pizza recipe"):
+        assert not is_data_request(prompt), prompt

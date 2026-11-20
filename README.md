@@ -55,7 +55,7 @@ pay the failed-request latency again. Every answer records which provider
 produced it; the sidebar runtime caption and **Test model connection** panel
 show that provider plus any earlier failures, so a fallback is never silent.
 
-**Usage and limits.** The sidebar's **Model usage today** panel shows requests
+**Usage and limits.** The usage circle in the top-right corner (hover for details) shows requests
 and tokens used today per provider, the daily limit, and how much is left, plus
 the token count of the latest answer. Groq's remaining requests and per-minute
 tokens come live from its response headers; Gemini sends no quota headers, so
@@ -69,6 +69,19 @@ Data note: prompts include dataset summaries and query results. Gemini's free
 tier allows Google to use prompts and responses to improve its products. If a
 dataset must not leave UGA systems, set `PANDA_LLM_PROVIDERS=local` (or drop
 `gemini`) for that deployment.
+
+### Dataset library and storage
+
+Datasets are chosen from the **Dataset library** dialog in the sidebar. Built-in
+datasets ship in `data/` and `rasters/`; uploads are saved under
+`PANDA_STORAGE_DIR/library/` (CSV, FVS CSV + shapefile, rasters + companions).
+Everything PANDA writes lives under `PANDA_STORAGE_DIR` (`/app/storage`):
+`canopy.sqlite` (chats and query tables), `library/` and `llm_usage.sqlite`.
+Nothing is stored on Irene. On Railway, attach a volume at `/app/storage`;
+without it, uploads, chats and usage counts are lost on each redeploy, and the
+library dialog shows a warning. Details: `docs-site/docs/data/dataset-library.md`.
+
+The running version (`version.py`) is shown bottom-right in the app.
 
 The storage volume preserves PANDA's SQLite chat database across deployments.
 Repository datasets remain part of the deployed image.

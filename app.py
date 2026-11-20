@@ -28,7 +28,8 @@ from streamlit_folium import st_folium
 from fvs_integration import discover_fvs_csvs
 from map_basemaps import carto_basemap
 from report_ui import render_report_panel
-from model_connection import render_model_connection, render_model_usage
+import dataset_library
+from model_connection import render_model_connection, render_usage_ring
 from llm_client import chat as llm_chat, list_models as list_llm_models, local_only, using_gateway
 from conversation import chat_messages, is_data_request
 from chat_shell import apply_chat_shell, chat_composer
@@ -89,6 +90,8 @@ THEME_PALETTES = {
         "accent_hover": "#195D39",
         "accent_soft": "rgba(36, 118, 75, 0.12)",
         "shadow": "0 12px 34px rgba(23, 63, 43, 0.08)",
+        "cta_bg": "#143024",
+        "cta_fg": "#FFFFFF",
     },
     "Dark": {
         "color_scheme": "dark",
@@ -103,20 +106,25 @@ THEME_PALETTES = {
         "accent_hover": "#7DD39B",
         "accent_soft": "rgba(97, 189, 131, 0.15)",
         "shadow": "0 14px 40px rgba(0, 0, 0, 0.24)",
+        "cta_bg": "#F1F5F2",
+        "cta_fg": "#0D1210",
     },
     "Forest": {
+        # Darker than before so white text has strong contrast (white text is ~18:1 on the background, ~17:1 on the sidebar).
         "color_scheme": "dark",
-        "background": "#081F18",
-        "sidebar": "#102B22",
-        "surface": "rgba(17, 53, 40, 0.90)",
-        "surface_strong": "#123B2C",
-        "text": "#F2F7F3",
-        "muted": "#B8CBBF",
-        "border": "rgba(216, 239, 224, 0.18)",
-        "accent": "#55B67A",
-        "accent_hover": "#72CB92",
-        "accent_soft": "rgba(85, 182, 122, 0.17)",
-        "shadow": "0 16px 44px rgba(0, 8, 5, 0.30)",
+        "background": "#04120D",
+        "sidebar": "#071B14",
+        "surface": "rgba(13, 40, 30, 0.92)",
+        "surface_strong": "#0E2F23",
+        "text": "#F3F8F4",
+        "muted": "#B3C8BA",
+        "border": "rgba(216, 239, 224, 0.14)",
+        "accent": "#5CC285",
+        "accent_hover": "#7AD69F",
+        "accent_soft": "rgba(92, 194, 133, 0.16)",
+        "shadow": "0 18px 48px rgba(0, 0, 0, 0.45)",
+        "cta_bg": "#F3F8F4",
+        "cta_fg": "#06231A",
     },
 }
 
@@ -141,6 +149,8 @@ def apply_app_theme(theme_name: str) -> None:
             --canopy-accent-hover: {palette['accent_hover']};
             --canopy-accent-soft: {palette['accent_soft']};
             --canopy-shadow: {palette['shadow']};
+            --panda-cta-bg: {palette['cta_bg']};
+            --panda-cta-fg: {palette['cta_fg']};
           }}
 
           .stApp,
@@ -359,7 +369,7 @@ def get_raster_files() -> List[Path]:
     files: List[Path] = []
     seen_paths = set()
 
-    for raster_dir in RASTER_SEARCH_DIRS:
+    for raster_dir in [*RASTER_SEARCH_DIRS, dataset_library.library_raster_dir()]:
         if not raster_dir.exists():
             continue
 
@@ -412,11 +422,12 @@ def get_raster_files() -> List[Path]:
     return sorted(preferred_files.values())
 
 
+def get_library_items() -> List["dataset_library.LibraryItem"]:
+    return dataset_library.list_items(DATA_DIR, RASTER_DIR, get_raster_files())
+
+
 def get_dataset_options() -> List[Tuple[str, Path]]:
-    fvs_options = [("fvs", path) for path in discover_fvs_csvs(DATA_DIR)]
-    csv_options = [("csv", path) for path in get_tree_csv_files()]
-    raster_options = [("raster", path) for path in get_raster_files()]
-    return fvs_options + csv_options + raster_options
+    return [(item.kind, item.path) for item in get_library_items()]
 
 
 def format_dataset_option(option: Tuple[str, Path]) -> str:
@@ -992,7 +1003,7 @@ def discover_raster_layers() -> List[Dict[str, Any]]:
     layers: List[Dict[str, Any]] = []
     seen_paths = set()
 
-    for raster_dir in RASTER_SEARCH_DIRS:
+    for raster_dir in [*RASTER_SEARCH_DIRS, dataset_library.library_raster_dir()]:
         if not raster_dir.exists():
             continue
 
@@ -2945,6 +2956,47 @@ def build_result(
 # AI responses
 # -----------------------------
 
+FVS_CAPABILITY_NOTE = (
+    "PANDA's FVS tools can, on request: summarize stands (count, acres, mean age, total volume as TCuFt x Acres), "
+    "filter by Age, Acres, TCuFt and other columns, chart acres or stand counts by age class, map stand polygons "
+    "(MU_ID joins the shapefile), and overlay matching TreeMap raster cells (TM_Value)."
+)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _profile_table(path_text: str, mtime_ns: int, kind: str) -> str:
+    """Compact, model-safe description of a table: columns, types, ranges, top values. No raw rows."""
+    df = pd.read_csv(path_text, low_memory=False)
+    lines = [f"Name: {Path(path_text).name}", f"Type: {'FVS stand results' if kind == 'fvs' else 'CSV table'}",
+             f"Rows: {len(df):,}", f"Columns ({len(df.columns)}):"]
+    for column in list(df.columns)[:60]:
+        series = df[column]
+        non_null = int(series.notna().sum())
+        if pd.api.types.is_numeric_dtype(series) and non_null:
+            lines.append(f"- {column} (number, {non_null:,} values): min {series.min():,.4g}, "
+                         f"max {series.max():,.4g}, mean {series.mean():,.4g}")
+        else:
+            top = series.dropna().astype(str).value_counts().head(4)
+            sample = ", ".join(f"{str(v)[:30]} ({c:,})" for v, c in top.items())
+            lines.append(f"- {column} (text, {series.nunique(dropna=True):,} distinct): {sample}")
+    if len(df.columns) > 60:
+        lines.append(f"- ...and {len(df.columns) - 60} more columns")
+    if kind == "fvs":
+        lines.append(FVS_CAPABILITY_NOTE)
+    return "\n".join(lines)
+
+
+def describe_dataset_for_model(kind: str, path: Path) -> str:
+    try:
+        if kind in {"csv", "fvs"}:
+            return _profile_table(str(path), path.stat().st_mtime_ns, kind)
+        return (f"Name: {path.name}\nType: raster ({path.suffix.lower()})\n"
+                "PANDA can preview this raster, list its metadata (size, cell size, projection, bands) "
+                "and summarize pixel values or attribute-table classes on request.")
+    except Exception as exc:
+        return f"Name: {path.name}\nType: {kind}\n(PANDA could not profile this dataset: {type(exc).__name__})"
+
+
 def explain_general_chat(prompt: str, model_name: str, use_model_explanation: bool, history=()) -> str:
     fallback = "AI answers are unavailable right now. Check the Model connection panel in the sidebar for the connection test and setup instructions."
 
@@ -2953,7 +3005,7 @@ def explain_general_chat(prompt: str, model_name: str, use_model_explanation: bo
 
     text = safe_ollama_chat(
         model_name,
-        chat_messages(prompt, history),
+        chat_messages(prompt, history, dataset_context=st.session_state.get("active_dataset_context", "")),
         options={"temperature": 0.6, "num_predict": 1200, "num_ctx": 8192},
     )
 
@@ -3588,43 +3640,90 @@ if st.session_state.get("app_theme") not in THEME_PALETTES:
 apply_app_theme(st.session_state["app_theme"])
 
 apply_chat_shell()
-sidebar_chat_actions = st.sidebar.container()
+sidebar_chat_actions = st.sidebar.container(key="panda-chat-actions")
 
-with st.sidebar.popover("Import dataset", width="stretch"):
-    st.caption("Supported: CSV, GeoTIFF, TIFF, ERDAS IMG, GDAL VRT, and JPEG 2000.")
-    uploaded_dataset = st.file_uploader(
-        "Choose a dataset",
-        type=["csv", "tif", "tiff", "img", "vrt", "jp2"],
-        accept_multiple_files=False,
-        help="CSV files are stored in data. Raster files are stored in rasters.",
-    )
-    if st.button("Add dataset", disabled=uploaded_dataset is None, width="stretch"):
-        imported_path, import_error = save_uploaded_dataset(uploaded_dataset)
-        if import_error:
-            st.error(import_error)
-        elif imported_path is not None:
-            imported_kind = "CSV" if imported_path.suffix.lower() == ".csv" else "Raster"
-            st.session_state["dataset_selector"] = f"{imported_path.name} ({imported_kind})"
-            st.success(f"Imported `{imported_path.name}`.")
-            st.rerun()
-
-    st.caption("A VRT may reference other raster files; those referenced files must also be available to PANDA.")
-
-dataset_options = get_dataset_options()
-
-if not dataset_options:
-    st.error("No datasets found. Put CSV files in the data folder or raster files in the data or rasters folder.")
+library_items = get_library_items()
+if not library_items:
+    st.error("No datasets found. Add CSV or raster files to the library, or to the data or rasters folder.")
     st.stop()
 
-dataset_labels = [format_dataset_option(option) for option in dataset_options]
+dataset_labels = [format_dataset_option((item.kind, item.path)) for item in library_items]
+st.session_state["panda_dataset_labels"] = dataset_labels
 if st.session_state.get("dataset_selector") not in dataset_labels:
     st.session_state["dataset_selector"] = dataset_labels[0]
-selected_dataset_label = st.sidebar.selectbox(
-    "Dataset",
-    dataset_labels,
-    key="dataset_selector",
-)
-dataset_kind, dataset_path = dataset_options[dataset_labels.index(selected_dataset_label)]
+
+
+@st.dialog("Dataset library", width="large")
+def render_dataset_library() -> None:
+    status = dataset_library.storage_status()
+    if status["persistent"] is False:
+        st.warning(
+            "Uploads and chats are stored at `" + str(status["path"]) + "`, which is not on a persistent volume. "
+            "They will be lost on the next redeploy. In Railway, attach a volume to this service at `/app/storage`."
+        )
+    elif status["persistent"]:
+        st.caption(f"Uploads and chats are saved on the persistent volume at `{status['path']}`.")
+
+    query = st.text_input("Search the library", placeholder="Name or type", label_visibility="collapsed",
+                          key="library-search")
+    active = st.session_state.get("dataset_selector")
+    shown = [(item, label) for item, label in zip(library_items, dataset_labels)
+             if not query or query.lower() in (item.name + " " + item.kind_label).lower()]
+    if not shown:
+        st.caption("No datasets match that search.")
+    for index, (item, label) in enumerate(shown):
+        with st.container(border=True, key=f"library-item-{index}"):
+            info, actions = st.columns([5, 2], vertical_alignment="center")
+            info.markdown(f"**{item.name}**")
+            info.caption(f"{item.kind_label} · {item.source} · {dataset_library.human_size(item.size_bytes)} · "
+                         f"added {item.added:%Y-%m-%d}")
+            if label == active:
+                actions.button("Analyzing", key=f"library-active-{index}", disabled=True, width="stretch")
+            elif actions.button("Analyze", key=f"library-pick-{index}", type="primary", width="stretch"):
+                st.session_state["dataset_selector"] = label
+                st.rerun()
+            if item.source == "Uploaded":
+                with actions.popover("Delete", width="stretch"):
+                    st.caption(f"Delete `{item.name}` and its companion files? Saved chats are kept.")
+                    if st.button("Delete permanently", key=f"library-delete-{index}", type="primary"):
+                        try:
+                            dataset_library.delete_item(item)
+                            if label == active:
+                                st.session_state.pop("dataset_selector", None)
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+
+    st.divider()
+    st.markdown("**Add to the library**")
+    st.caption("CSV tables, rasters (GeoTIFF, TIFF, IMG, VRT, JPEG 2000) and their companion files. "
+               "Upload an FVS CSV together with its .shp, .shx and .dbf (same name) to enable stand polygon maps.")
+    uploads = st.file_uploader("Choose files", type=dataset_library.UPLOAD_TYPES, accept_multiple_files=True,
+                               label_visibility="collapsed", key="library-upload")
+    if st.button("Add to library", disabled=not uploads, type="primary"):
+        saved, errors = dataset_library.save_uploads(
+            [(f.name, f.getvalue()) for f in uploads], [item.name for item in library_items])
+        for error in errors:
+            st.error(error)
+        if saved:
+            first = saved[0]
+            kind = "fvs" if first.parent.name == "fvs" else ("raster" if first.suffix.lower() in RASTER_EXTENSIONS else "csv")
+            st.session_state["dataset_selector"] = format_dataset_option((kind, first))
+            if not errors:
+                st.rerun()
+
+
+active_item = library_items[dataset_labels.index(st.session_state["dataset_selector"])]
+with st.sidebar.container(key="panda-active-dataset"):
+    from html import escape as _esc
+    st.markdown(f'<div class="panda-ds"><div class="label">Analyzing</div>'
+                f'<div class="name" title="{_esc(active_item.name)}">{_esc(active_item.name)}</div>'
+                f'<div class="kind">{_esc(active_item.kind_label)} · {_esc(active_item.source)}</div></div>',
+                unsafe_allow_html=True)
+    if st.button("Dataset library", icon=":material/folder_open:", width="stretch", key="open-library"):
+        render_dataset_library()
+dataset_kind, dataset_path = active_item.kind, active_item.path
+st.session_state["active_dataset_context"] = describe_dataset_for_model(dataset_kind, dataset_path)
 
 with st.sidebar.expander("Appearance & data", expanded=False):
     st.segmented_control("Theme", list(THEME_PALETTES), selection_mode="single",
@@ -3634,7 +3733,7 @@ with st.sidebar.expander("Appearance & data", expanded=False):
 models = get_installed_ollama_models()
 with st.sidebar:
     render_model_connection()
-    render_model_usage()
+render_usage_ring()
 question_preferred_order = ["qwen2.5:3b", "qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b"]
 schema_preferred_order = ["qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b", "qwen2.5:3b"]
 

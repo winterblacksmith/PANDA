@@ -118,7 +118,7 @@ def build_pdf(entries, dataset, title, model, summary, ai_generated, notice, gen
     from reportlab.lib.enums import TA_LEFT
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, HRFlowable
 
     # ReportLab ships Vera, so Linux and macOS use the same embedded font.
     font_dir = Path(reportlab.__file__).parent / "fonts"
@@ -130,8 +130,12 @@ def build_pdf(entries, dataset, title, model, summary, ai_generated, notice, gen
 
     def clean(text):
         text = str(text).replace("\x00", "").replace("\t", "    ")
-        for mark in ("\u2010", "\u2011", "\u2012", "\u2013", "\u2014"):
+        for mark in ("\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212"):
             text = text.replace(mark, "-")
+        # Models often emit narrow/no-break/thin spaces; Vera has no glyph for some of them.
+        for space in ("\u202f", "\u00a0", "\u2009", "\u2007", "\u200a", "\u2002", "\u2003"):
+            text = text.replace(space, " ")
+        text = text.replace("\u200b", "").replace("\u2022", "-")
         return "".join(c if c == "\n" or ord(c) in supported else f"[U+{ord(c):04X}]" for c in text)
 
     styles = getSampleStyleSheet()
@@ -141,6 +145,11 @@ def build_pdf(entries, dataset, title, model, summary, ai_generated, notice, gen
                               textColor=colors.HexColor("#217A4D"), spaceBefore=14, spaceAfter=7))
     styles.add(ParagraphStyle("PandaBody", fontName="PandaVera", fontSize=9, leading=14,
                               alignment=TA_LEFT, spaceAfter=7, splitLongWords=True))
+    styles.add(ParagraphStyle("PandaUser", parent=styles["PandaHeading"], textColor=colors.HexColor("#1F4E79")))
+    styles.add(ParagraphStyle("PandaSub", fontName="PandaVeraBold", fontSize=10, leading=14,
+                              textColor=colors.HexColor("#173F2C"), spaceBefore=8, spaceAfter=4))
+    styles.add(ParagraphStyle("PandaBullet", parent=styles["PandaBody"], leftIndent=14, bulletIndent=4, spaceAfter=3))
+    styles.add(ParagraphStyle("PandaCell", fontName="PandaVera", fontSize=8, leading=11, splitLongWords=True))
     styles.add(ParagraphStyle("PandaNote", parent=styles["PandaBody"], fontSize=8,
                               textColor=colors.HexColor("#54675C")))
     buffer = BytesIO()
@@ -148,24 +157,70 @@ def build_pdf(entries, dataset, title, model, summary, ai_generated, notice, gen
                             topMargin=52, bottomMargin=52, title=clean(title), author="PANDA")
     story = []
 
+    def inline(raw):
+        """Escape everything, then re-add only PANDA's own markup for **bold**, *italic*, `code`."""
+        safe = escape(raw)
+        safe = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", safe)
+        safe = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", safe)
+        safe = re.sub(r"`([^`]+)`", r'<font face="Courier">\1</font>', safe)
+        return safe.replace("\\*", "*")
+
+    def table_flowable(rows):
+        cells = [[c.strip() for c in row.strip().strip("|").split("|")] for row in rows]
+        cells = [r for r in cells if not all(re.fullmatch(r":?-{2,}:?", c or "-") for c in r)]
+        if not cells:
+            return None
+        width = max(len(r) for r in cells)
+        data = [[Paragraph(inline(c), styles["PandaCell"]) for c in r + [""] * (width - len(r))] for r in cells]
+        table = Table(data, colWidths=[499.0 / width] * width, repeatRows=1, hAlign="LEFT")
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E3F0E7")),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#B9CFC0")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        return table
+
     def add(text, style="PandaBody", markdown=False):
         # Bound each flowable for long transcripts/JSON; escape all user markup.
-        for paragraph in clean(text).split("\n"):
+        lines = clean(text).split("\n")
+        index = 0
+        while index < len(lines):
+            paragraph = lines[index]
+            index += 1
             if not paragraph.strip():
                 story.append(Spacer(1, 4))
                 continue
-            paragraph_style = style
-            if markdown and re.match(r"^#{1,6}\s+", paragraph):
-                paragraph = re.sub(r"^#{1,6}\s+", "", paragraph)
-                paragraph_style = "PandaHeading"
+            if not markdown:
+                for start in range(0, len(paragraph), 1800):
+                    story.append(Paragraph(escape(paragraph[start:start + 1800]), styles[style]))
+                continue
+            stripped = paragraph.strip()
+            if stripped.startswith("|"):
+                block = [paragraph]
+                while index < len(lines) and lines[index].strip().startswith("|"):
+                    block.append(lines[index])
+                    index += 1
+                table = table_flowable(block)
+                if table is not None:
+                    story.extend([table, Spacer(1, 6)])
+                continue
+            if re.fullmatch(r"(-{3,}|\*{3,}|_{3,})", stripped):
+                story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#C5D9CC"),
+                                        spaceBefore=4, spaceAfter=6))
+                continue
+            heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+            if heading:
+                level_style = "PandaHeading" if len(heading.group(1)) <= 2 else "PandaSub"
+                story.append(Paragraph(inline(heading.group(2).strip("* ")), styles[level_style]))
+                continue
+            bullet = re.match(r"^\s*[*-]\s+(.*)$", paragraph)
+            if bullet:
+                story.append(Paragraph(inline(bullet.group(1)[:1800]), styles["PandaBullet"], bulletText="\u2022"
+                                       if 0x2022 in supported else "-"))
+                continue
             for start in range(0, len(paragraph), 1800):
-                safe = escape(paragraph[start:start + 1800])
-                if markdown:
-                    # Only our own supported markup is emitted; LLM/user HTML
-                    # remains escaped, including tags inside bold/code spans.
-                    safe = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", safe)
-                    safe = re.sub(r"`([^`]+)`", r"\1", safe)
-                story.append(Paragraph(safe, styles[paragraph_style]))
+                story.append(Paragraph(inline(paragraph[start:start + 1800]), styles[style]))
 
     stamp = generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     add("PANDA", "PandaTitle")
@@ -180,12 +235,13 @@ def build_pdf(entries, dataset, title, model, summary, ai_generated, notice, gen
     add("This export covers the selected conversation and dataset only. It uses the saved messages and results, "
         "without re-running queries. Table samples are labeled. Interactive maps and charts are described by their "
         "recorded answers and parameters; map images and the full underlying datasets are not embedded. "
-        "Unsupported font characters are shown as Unicode code points in brackets.", "PandaNote")
+        "Characters the PDF font cannot draw are shown as Unicode code points in brackets.", "PandaNote")
     story.append(PageBreak())
     add("Conversation and recorded results", "PandaTitle")
     for entry in entries:
-        add(f"{entry['number']}. {entry['role'].title()}", "PandaHeading")
-        add(entry["text"])
+        role = {"user": "You", "assistant": "PANDA"}.get(entry["role"], entry["role"].title())
+        add(f"{entry['number']}. {role}", "PandaHeading" if entry["role"] != "user" else "PandaUser")
+        add(entry["text"], markdown=entry["role"] == "assistant")
 
     def page_footer(canvas, document):
         canvas.saveState()
@@ -201,12 +257,15 @@ def build_pdf(entries, dataset, title, model, summary, ai_generated, notice, gen
     return buffer.getvalue()
 
 
-def generate_report(messages, dataset, title, model, chat, use_llm=True):
+def generate_report(messages, dataset, title, model, chat, use_llm=True, describe_model=None):
+    """`describe_model`, if given, is called after summarizing and names the
+    provider/model that actually wrote the summary (e.g. "Groq (openai/gpt-oss-120b)")."""
     entries = conversation_entries(messages)
     if not entries:
         raise ValueError("Start a conversation before generating a report.")
     summary, ai_generated, notice = summarize_conversation(entries, dataset, model, chat, use_llm)
-    return Report(build_pdf(entries, dataset, title, model, summary, ai_generated, notice),
+    model_label = (describe_model() if (ai_generated and describe_model) else None) or model
+    return Report(build_pdf(entries, dataset, title, model_label, summary, ai_generated, notice),
                   summary, ai_generated, notice)
 
 

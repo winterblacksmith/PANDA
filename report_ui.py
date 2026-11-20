@@ -5,9 +5,12 @@ from conversation_report import generate_report, report_filename, report_fingerp
 
 @st.fragment
 def render_report_panel(messages, dataset, chat_id, title, model, chat):
-    if not messages:
-        return
-    with st.expander("Download conversation report", expanded=False):
+    with st.container(key="panda-topbar-download"), st.popover("", icon=":material/download:",
+                                                              help="Download conversation report"):
+        st.markdown("**Conversation report**")
+        if not messages:
+            st.caption("Start a conversation to create a PDF report.")
+            return
         st.caption("Summarize this chat and download a PDF with the full conversation and recorded results. "
                    "Maps are described, not embedded as images.")
         key = f"report::{dataset}::{chat_id}"
@@ -16,7 +19,8 @@ def render_report_panel(messages, dataset, chat_id, title, model, chat):
         if st.button("Generate PDF report", disabled=not messages, key=key + "::generate"):
             try:
                 with st.spinner("Preparing your conversation report..."):
-                    report = generate_report(messages, dataset, title, model, chat, use_llm)
+                    report = generate_report(messages, dataset, title, model, chat, use_llm,
+                                             describe_model=lambda: st.session_state.get("ollama_runtime"))
                 # Keep only the most recent report per browser session, never share
                 # private conversation PDFs through Streamlit's global data cache.
                 st.session_state["panda_report"] = (key, fingerprint, report)

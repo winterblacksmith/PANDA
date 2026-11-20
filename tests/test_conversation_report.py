@@ -31,7 +31,7 @@ def test_pdf_preserves_all_message_shapes_and_escapes_markup():
     result = generate_report(messages, "test.csv", "Forest <report>", "qwen2.5:3b", chat)
     assert result.ai_generated
     text = "\n".join(p.extract_text() for p in PdfReader(BytesIO(result.pdf)).pages)
-    for expected in ("4,222", "EPSG:5070", "<please>", "SQL", "Oak", "Pine", "5. Assistant"):
+    for expected in ("4,222", "EPSG:5070", "<please>", "SQL", "Oak", "Pine", "5. PANDA", "1. You"):
         assert expected in text
     assert "DO_NOT_INCLUDE" not in text
     assert "DO_NOT_INCLUDE" not in calls[0]

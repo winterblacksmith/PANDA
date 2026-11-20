@@ -12,7 +12,7 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Data',
-      items: ['data/fvs-treemap'],
+      items: ['data/fvs-treemap', 'data/dataset-library'],
     },
     {
       type: 'category',
