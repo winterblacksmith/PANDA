@@ -29,6 +29,7 @@ from fvs_integration import discover_fvs_csvs
 from map_basemaps import carto_basemap
 from report_ui import render_report_panel
 import dataset_library
+from response_actions import message_text, preceding_question, render_response_actions
 from model_connection import render_model_connection, render_usage_ring
 from llm_client import chat as llm_chat, list_models as list_llm_models, local_only, using_gateway
 from conversation import chat_messages, is_data_request
@@ -3424,6 +3425,9 @@ def render_assistant_results(
 
         if result.get("type") == "general_chat":
             st.write(result["content"])
+            render_response_actions(dataset=csv_name, chat_id=active_chat_id, message_index=message_index,
+                                    part=result_index, question=str(result.get("question") or ""),
+                                    answer=str(result["content"]))
             continue
 
         instructions = result["instructions"]
@@ -3439,25 +3443,12 @@ def render_assistant_results(
         if extras_key not in st.session_state:
             st.session_state[extras_key] = False
 
-        answer_col, menu_col = st.columns([0.94, 0.06], vertical_alignment="center")
-
-        with answer_col:
-            st.write(explanation)
-
-        with menu_col:
-            menu_key = f"extras-menu::{csv_name}::{active_chat_id}::{message_index}::{result_index}"
-            checkbox_key = f"extras-checkbox::{csv_name}::{active_chat_id}::{message_index}::{result_index}"
-
-            if hasattr(st, "popover"):
-                with st.popover("...", help="Response options", width="stretch", key=menu_key):
-                    st.session_state[extras_key] = st.checkbox(
-                        "Show data result and developer details",
-                        value=st.session_state[extras_key],
-                        key=checkbox_key,
-                    )
-            elif st.button("...", key=menu_key, help="Show or hide data and developer details"):
-                st.session_state[extras_key] = not st.session_state[extras_key]
-                st.rerun()
+        st.write(explanation)
+        render_response_actions(
+            dataset=csv_name, chat_id=active_chat_id, message_index=message_index, part=result_index,
+            question=str(payload.get("question") or result.get("question") or ""),
+            answer=str(explanation), extras_key=extras_key,
+        )
 
         show_extras = st.session_state[extras_key]
 
@@ -3653,64 +3644,87 @@ if st.session_state.get("dataset_selector") not in dataset_labels:
     st.session_state["dataset_selector"] = dataset_labels[0]
 
 
+LIBRARY_KIND_ICONS = {"fvs": "forest", "csv": "table_chart", "raster": "satellite_alt"}
+
+
 @st.dialog("Dataset library", width="large")
 def render_dataset_library() -> None:
+    from html import escape as _esc
+
     status = dataset_library.storage_status()
     if status["persistent"] is False:
-        st.warning(
-            "Uploads and chats are stored at `" + str(status["path"]) + "`, which is not on a persistent volume. "
-            "They will be lost on the next redeploy. In Railway, attach a volume to this service at `/app/storage`."
-        )
+        st.markdown(
+            '<div class="panda-lib-note warn"><span class="material-symbols-rounded">warning</span><div>'
+            f'<b>Uploads are temporary.</b> PANDA stores them at <code>{_esc(str(status["path"]))}</code>, which is '
+            'not on a persistent volume, so they and saved chats are lost on redeploy. '
+            'In Railway, attach a volume to this service at <code>/app/storage</code>.</div></div>',
+            unsafe_allow_html=True)
     elif status["persistent"]:
-        st.caption(f"Uploads and chats are saved on the persistent volume at `{status['path']}`.")
+        st.markdown('<div class="panda-lib-note ok"><span class="material-symbols-rounded">cloud_done</span>'
+                    '<div>Uploads and chats are saved on the persistent volume.</div></div>', unsafe_allow_html=True)
 
-    query = st.text_input("Search the library", placeholder="Name or type", label_visibility="collapsed",
-                          key="library-search")
+    search_col, filter_col = st.columns([3, 2], vertical_alignment="center")
+    query = search_col.text_input("Search the library", placeholder="Search datasets", label_visibility="collapsed",
+                                  key="library-search", icon=":material/search:")
+    kind_filter = filter_col.segmented_control("Type", ["All", "FVS", "CSV", "Raster"], default="All",
+                                               label_visibility="collapsed", key="library-filter",
+                                               width="stretch") or "All"
     active = st.session_state.get("dataset_selector")
+    wanted = {"All": None, "FVS": "fvs", "CSV": "csv", "Raster": "raster"}[kind_filter]
     shown = [(item, label) for item, label in zip(library_items, dataset_labels)
-             if not query or query.lower() in (item.name + " " + item.kind_label).lower()]
+             if (wanted is None or item.kind == wanted)
+             and (not query or query.lower() in (item.name + " " + item.kind_label).lower())]
+    st.markdown(f'<div class="panda-lib-count">{len(shown)} of {len(library_items)} datasets</div>',
+                unsafe_allow_html=True)
     if not shown:
-        st.caption("No datasets match that search.")
+        st.caption("No datasets match.")
     for index, (item, label) in enumerate(shown):
-        with st.container(border=True, key=f"library-item-{index}"):
-            info, actions = st.columns([5, 2], vertical_alignment="center")
-            info.markdown(f"**{item.name}**")
-            info.caption(f"{item.kind_label} · {item.source} · {dataset_library.human_size(item.size_bytes)} · "
-                         f"added {item.added:%Y-%m-%d}")
-            if label == active:
-                actions.button("Analyzing", key=f"library-active-{index}", disabled=True, width="stretch")
-            elif actions.button("Analyze", key=f"library-pick-{index}", type="primary", width="stretch"):
-                st.session_state["dataset_selector"] = label
-                st.rerun()
-            if item.source == "Uploaded":
-                with actions.popover("Delete", width="stretch"):
-                    st.caption(f"Delete `{item.name}` and its companion files? Saved chats are kept.")
-                    if st.button("Delete permanently", key=f"library-delete-{index}", type="primary"):
-                        try:
-                            dataset_library.delete_item(item)
-                            if label == active:
-                                st.session_state.pop("dataset_selector", None)
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(str(exc))
+        is_active = label == active
+        with st.container(key=f"library-row-{index}{'-active' if is_active else ''}"):
+            info, actions = st.columns([6, 2], vertical_alignment="center", gap="small")
+            info.markdown(
+                f'<div class="panda-lib-item"><span class="panda-lib-icon {item.kind}">'
+                f'<span class="material-symbols-rounded">{LIBRARY_KIND_ICONS[item.kind]}</span></span>'
+                f'<div class="panda-lib-text"><div class="name" title="{_esc(item.name)}">{_esc(item.name)}</div>'
+                f'<div class="meta">{_esc(item.kind_label)} · {dataset_library.human_size(item.size_bytes)} · '
+                f'{_esc(item.source)} · added {item.added:%b %d, %Y}</div></div></div>',
+                unsafe_allow_html=True)
+            with actions:
+                if is_active:
+                    st.markdown('<div class="panda-lib-badge"><span></span>Analyzing</div>', unsafe_allow_html=True)
+                elif st.button("Analyze", key=f"library-pick-{index}", width="stretch"):
+                    st.session_state["dataset_selector"] = label
+                    st.rerun()
+                if item.source == "Uploaded":
+                    with st.popover("Delete", icon=":material/delete:", width="stretch"):
+                        st.caption(f"Delete `{item.name}` and its companion files? Saved chats are kept.")
+                        if st.button("Delete permanently", key=f"library-delete-{index}", type="primary"):
+                            try:
+                                dataset_library.delete_item(item)
+                                if is_active:
+                                    st.session_state.pop("dataset_selector", None)
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(str(exc))
 
-    st.divider()
-    st.markdown("**Add to the library**")
-    st.caption("CSV tables, rasters (GeoTIFF, TIFF, IMG, VRT, JPEG 2000) and their companion files. "
-               "Upload an FVS CSV together with its .shp, .shx and .dbf (same name) to enable stand polygon maps.")
-    uploads = st.file_uploader("Choose files", type=dataset_library.UPLOAD_TYPES, accept_multiple_files=True,
-                               label_visibility="collapsed", key="library-upload")
-    if st.button("Add to library", disabled=not uploads, type="primary"):
-        saved, errors = dataset_library.save_uploads(
-            [(f.name, f.getvalue()) for f in uploads], [item.name for item in library_items])
-        for error in errors:
-            st.error(error)
-        if saved:
-            first = saved[0]
-            kind = "fvs" if first.parent.name == "fvs" else ("raster" if first.suffix.lower() in RASTER_EXTENSIONS else "csv")
-            st.session_state["dataset_selector"] = format_dataset_option((kind, first))
-            if not errors:
-                st.rerun()
+    with st.container(key="library-upload-section"):
+        st.markdown('<div class="panda-lib-section">Add datasets</div>'
+                    '<div class="panda-lib-help">CSV tables, rasters (GeoTIFF, IMG, VRT, JPEG 2000) and companion files. '
+                    'Upload an FVS CSV with its .shp, .shx and .dbf (same name) to enable stand maps.</div>',
+                    unsafe_allow_html=True)
+        uploads = st.file_uploader("Choose files", type=dataset_library.UPLOAD_TYPES, accept_multiple_files=True,
+                                   label_visibility="collapsed", key="library-upload")
+        if st.button("Add to library", disabled=not uploads, type="primary", icon=":material/add:"):
+            saved, errors = dataset_library.save_uploads(
+                [(f.name, f.getvalue()) for f in uploads], [item.name for item in library_items])
+            for error in errors:
+                st.error(error)
+            if saved:
+                first = saved[0]
+                kind = "fvs" if first.parent.name == "fvs" else ("raster" if first.suffix.lower() in RASTER_EXTENSIONS else "csv")
+                st.session_state["dataset_selector"] = format_dataset_option((kind, first))
+                if not errors:
+                    st.rerun()
 
 
 active_item = library_items[dataset_labels.index(st.session_state["dataset_selector"])]
@@ -3939,9 +3953,13 @@ if dataset_kind == "raster":
                 key=f"selected-raster-footprint::{dataset_path.name}",
             )
 
-    for message in messages:
+    for message_index, message in enumerate(messages):
         with st.chat_message(message["role"]):
             st.write(message["content"])
+            if message["role"] == "assistant":
+                render_response_actions(dataset=raster_key, chat_id=active_chat_id, message_index=message_index,
+                                        question=preceding_question(messages, message_index),
+                                        answer=message_text(message))
 
     suggested_prompt = st.session_state.pop(suggested_prompt_key, None)
     prompt = chat_composer(messages, "raster-composer")
@@ -3971,6 +3989,8 @@ if dataset_kind == "raster":
                 else:
                     answer = answer_raster_question(cleaned_prompt, raster_layer, model_name, use_model_explanation)
             st.write(answer)
+            render_response_actions(dataset=raster_key, chat_id=active_chat_id, message_index=len(messages),
+                                    question=cleaned_prompt, answer=str(answer))
 
         messages.append({
             "role": "assistant",
@@ -4426,6 +4446,11 @@ for message_index, message in enumerate(messages):
         else:
             if message.get("content"):
                 st.write(message["content"])
+                if not message.get("results"):
+                    render_response_actions(dataset=csv_choice.name, chat_id=active_chat_id,
+                                            message_index=message_index,
+                                            question=preceding_question(messages, message_index),
+                                            answer=message_text(message))
 
             if message.get("results"):
                 render_assistant_results(

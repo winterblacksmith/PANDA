@@ -11,6 +11,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 from safe_streamlit_render import render_html_bar_chart, render_html_table
 from report_ui import render_report_panel
+from response_actions import message_text, preceding_question, render_response_actions
 from conversation import is_data_request
 from chat_shell import chat_composer
 
@@ -247,6 +248,9 @@ def render_fvs_mode(
                             result, csv_path, database_path, raster_dir, table_name,
                             active_chat_id, message_index,
                         )
+                render_response_actions(dataset=dataset_key, chat_id=active_chat_id, message_index=message_index,
+                                        question=preceding_question(messages, message_index),
+                                        answer=message_text(message))
 
     suggested_prompt = st.session_state.pop(suggested_key, None)
     prompt = chat_composer(messages, "fvs-composer")
@@ -293,6 +297,8 @@ def render_fvs_mode(
                         active_chat_id, len(messages),
                     )
                 messages.append({"role": "assistant", "results": [result]})
+            render_response_actions(dataset=dataset_key, chat_id=active_chat_id, message_index=len(messages) - 1,
+                                    question=cleaned_prompt, answer=message_text(messages[-1]))
         persist_current_chat(dataset_key, chats_key, active_chat_id)
 
     render_report_panel(messages, dataset_key, active_chat_id,

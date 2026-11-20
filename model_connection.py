@@ -102,6 +102,15 @@ def render_model_connection():
         if result and result[:2] == (raw_host, model):
             (st.success if result[2] else st.error)(result[3])
         st.caption("Provider keys and the Irene gateway URL are set as Railway variables; see README.")
+        try:
+            from response_actions import flags_csv
+            count, data = flags_csv()
+            st.markdown(f"**Flagged answers:** {count}")
+            if count:
+                st.download_button("Download flagged answers (CSV)", data, file_name="panda-flagged-answers.csv",
+                                   mime="text/csv", icon=":material/download:", key="download-flags")
+        except Exception as exc:
+            st.caption(f"Flagged answers unavailable: {type(exc).__name__}")
 
 
 def _fmt(value):
