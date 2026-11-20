@@ -23,7 +23,8 @@ def openai_reply(text, model="hosted-model"):
 
 
 @pytest.fixture(autouse=True)
-def clean_env(monkeypatch):
+def clean_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("PANDA_STORAGE_DIR", str(tmp_path))
     for name in ("GROQ_API_KEY", "GEMINI_API_KEY", "PANDA_LLM_PROVIDERS",
                  "PANDA_INFERENCE_URL", "PANDA_INFERENCE_TOKEN",
                  "PANDA_GROQ_MODEL", "PANDA_GEMINI_MODEL",

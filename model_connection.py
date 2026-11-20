@@ -4,6 +4,8 @@ from urllib.parse import urlsplit
 
 import streamlit as st
 
+import llm_usage
+
 from llm_client import (
     HOSTED_PROVIDERS,
     LLMConnectionError,
@@ -100,3 +102,58 @@ def render_model_connection():
         if result and result[:2] == (raw_host, model):
             (st.success if result[2] else st.error)(result[3])
         st.caption("Provider keys and the Irene gateway URL are set as Railway variables; see README.")
+
+
+def _fmt(value):
+    return f"{value:,}" if isinstance(value, int) else "?"
+
+
+def _usage_bar(label, used, limit, remaining):
+    if limit:
+        left = remaining if remaining is not None else max(0, limit - used)
+        st.caption(f"{label}: **{_fmt(used)}** of {_fmt(limit)} used, **{_fmt(left)} left**")
+        st.progress(min(1.0, used / limit) if limit else 0.0)
+    else:
+        st.caption(f"{label}: **{_fmt(used)}** used (no daily limit set)")
+
+
+def render_model_usage():
+    """Tokens and requests used today per provider, with limits and what is left."""
+    with st.expander("Model usage today", expanded=False):
+        try:
+            chain = provider_chain()
+        except LLMConnectionError:
+            chain = []
+        data = llm_usage.provider_rows(providers=chain or None)
+        if not data["rows"]:
+            st.caption("No model providers configured.")
+            return
+        last = st.session_state.get("last_llm_usage")
+        if last:
+            st.caption(f"Last answer: **{_fmt(last.get('total_tokens', 0))} tokens** "
+                       f"({_fmt(last.get('prompt_tokens', 0))} in, {_fmt(last.get('completion_tokens', 0))} out) "
+                       f"via {last.get('label', 'model')}")
+        for row in data["rows"]:
+            name = row["provider"]
+            st.markdown(f"**{provider_label(name)}**")
+            if name == "local":
+                st.caption(f"Requests: **{_fmt(row['requests_used'])}**, tokens: **{_fmt(row['tokens_used'])}** "
+                           "(self-hosted, no provider quota)")
+                continue
+            _usage_bar("Requests", row["requests_used"] if row["live"] is None
+                       else row["requests_limit"] - (row["requests_remaining"] or 0),
+                       row["requests_limit"], row["requests_remaining"])
+            _usage_bar("Tokens", row["tokens_used"], row["tokens_limit"], row["tokens_remaining"])
+            live = row["live"]
+            if live and live.get("limit_tokens"):
+                st.caption(f"Per-minute tokens: {_fmt(live['remaining_tokens'])} of "
+                           f"{_fmt(live['limit_tokens'])} left (resets in {live.get('reset_tokens') or '?'})")
+            source = ("Requests reported live by Groq; tokens counted by PANDA."
+                      if row["source"] == "reported by provider"
+                      else "Counted by PANDA (this provider does not report its quota).")
+            st.caption(source)
+            if len(row["models"]) > 1:
+                st.caption(" · ".join(f"{m['model']}: {_fmt(m['requests'])} req, {_fmt(m['tokens'])} tok"
+                                      for m in row["models"]))
+        st.caption(f"Day {data['day']} (Pacific). Daily quotas reset at midnight Pacific / 3 AM Eastern. "
+                   "Exact account limits: console.groq.com/settings/limits and aistudio.google.com/rate-limit.")

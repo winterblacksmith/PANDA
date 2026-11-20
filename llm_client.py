@@ -19,6 +19,8 @@ from typing import Any, Dict, Iterable, List, Optional
 import httpx
 import ollama
 
+import llm_usage
+
 
 DEFAULT_MODEL = "qwen2.5:3b"
 
@@ -278,6 +280,7 @@ def _hosted_model_chat(
                   503: "overloaded"}.get(response.status_code, "error")
         retry = _retry_after_seconds(response) if response.status_code == 429 else 0.0
         raise _ModelFailure(f"{model}: HTTP {response.status_code} {reason}", response.status_code, retry)
+    llm_usage.record_quota_headers(name, response.headers)
     try:
         payload = response.json()
         content = payload["choices"][0]["message"].get("content") or ""
@@ -288,6 +291,7 @@ def _hosted_model_chat(
     return {
         "model": payload.get("model") or model,
         "message": {"role": "assistant", "content": str(content)},
+        "usage": llm_usage.normalize_usage(payload.get("usage")),
         "done": True,
     }
 
@@ -384,8 +388,12 @@ def chat(
             # ollama.ChatResponse objects support dict-style access via model_dump.
             dump = getattr(result, "model_dump", None)
             result = dump() if callable(dump) else {"message": {"content": str(result)}}
+        if "usage" not in result:
+            # Ollama (direct or via the Irene gateway) reports prompt_eval_count/eval_count.
+            result["usage"] = llm_usage.normalize_usage(result)
         result["provider"] = name
         result["provider_label"] = provider_label(name)
         result["fallback_errors"] = errors
+        llm_usage.record(name, str(result.get("model") or model), result["usage"])
         return result
     raise LLMConnectionError("All model providers failed: " + "; ".join(errors))

@@ -1,6 +1,7 @@
 # PANDA Irene FastAPI Integration Worklog
 
 **Started:** 2026-11-01
+**Last updated:** 2026-11-20
 **Integration branch:** `integration/irene-fastapi`
 **Application baseline:** `railway/pdf-reports-model-connection`
 **Repository:** `winterblacksmith/PANDA`
@@ -574,3 +575,28 @@ Causes and fixes in `llm_client.py`:
 
 Tests: 39 passed (12 router tests incl. 404 model fallback, reasoning payload,
 Railway local skip). Not yet re-verified live on Railway.
+
+## 2026-11-20: Token usage and limits panel; dated documentation
+
+User asked for KTPI-style token usage plus total limits and remaining quota in
+PANDA, and for every document to show when it was last updated.
+
+- KTPI (ktpuga/KTPI) records input/output tokens per run from each response's
+  `usage` field but does not show limits. PANDA now does both.
+- `llm_usage.py` (new): stores per-day (Pacific) requests and prompt/completion
+  tokens per provider and model in `<PANDA_STORAGE_DIR>/llm_usage.sqlite`;
+  stores Groq's `x-ratelimit-*` headers (daily requests limit/remaining,
+  per-minute tokens limit/remaining, reset times). Gemini sends no quota
+  headers (confirmed on Google's developer forum), so its limits come from
+  `PANDA_GEMINI_DAILY_REQUESTS` (default 500, KTPI's documented Flash-Lite
+  allowance). Groq defaults 1,000 RPD / 200,000 TPD from Groq's Free plan table
+  for gpt-oss models (checked 2026-11-20). Counts only; no text or keys stored.
+- `llm_client.py`: every answer carries `usage`; successful requests are
+  recorded; Ollama `prompt_eval_count`/`eval_count` used for local answers.
+- `model_connection.py` + `app.py`: sidebar "Model usage today" panel with
+  used / limit / left and progress bars, live Groq per-minute tokens, and the
+  last answer's token count.
+- Docs: new `docs-site/docs/architecture/model-providers.md`; every docs-site
+  page now has `last_update` front matter (dates from git history) and
+  `showLastUpdateTime` is enabled; README and this worklog carry a dated header.
+- Tests: 44 passed (5 new usage tests incl. no text/keys in the usage DB).

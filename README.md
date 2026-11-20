@@ -1,5 +1,7 @@
 # PANDA
 
+_Last updated: 2026-11-20_
+
 **PANDA** stands for **PERSEUS AI for Natural-language Data Analysis**. It is a
 Streamlit chat interface for querying and visualizing forestry, FVS, vector, and
 raster datasets from the PERSEUS project with a self-hosted Ollama model.
@@ -52,6 +54,16 @@ is skipped for its `Retry-After` period (default 60 s) so later questions do not
 pay the failed-request latency again. Every answer records which provider
 produced it; the sidebar runtime caption and **Test model connection** panel
 show that provider plus any earlier failures, so a fallback is never silent.
+
+**Usage and limits.** The sidebar's **Model usage today** panel shows requests
+and tokens used today per provider, the daily limit, and how much is left, plus
+the token count of the latest answer. Groq's remaining requests and per-minute
+tokens come live from its response headers; Gemini sends no quota headers, so
+PANDA counts its usage against `PANDA_GEMINI_DAILY_REQUESTS` (default 500).
+Defaults for Groq are 1,000 requests and 200,000 tokens per day
+(`PANDA_GROQ_DAILY_REQUESTS`, `PANDA_GROQ_DAILY_TOKENS`). Counts are stored per
+Pacific-time day in `llm_usage.sqlite` under `PANDA_STORAGE_DIR` (counts only,
+no prompts, answers or keys). Full details: `docs-site/docs/architecture/model-providers.md`.
 
 Data note: prompts include dataset summaries and query results. Gemini's free
 tier allows Google to use prompts and responses to improve its products. If a

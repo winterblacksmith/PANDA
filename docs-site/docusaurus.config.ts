@@ -21,6 +21,8 @@ const config: Config = {
           sidebarPath: './sidebars.ts',
           editUrl: 'https://github.com/winterblacksmith/tree_ai_demo/edit/main/docs-site/',
           routeBasePath: 'docs',
+          // Dates come from each page's last_update front matter, so builds without git history still show them.
+          showLastUpdateTime: true,
         },
         blog: false,
         theme: {customCss: './src/css/custom.css'},

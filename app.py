@@ -28,7 +28,7 @@ from streamlit_folium import st_folium
 from fvs_integration import discover_fvs_csvs
 from map_basemaps import carto_basemap
 from report_ui import render_report_panel
-from model_connection import render_model_connection
+from model_connection import render_model_connection, render_model_usage
 from llm_client import chat as llm_chat, list_models as list_llm_models, local_only, using_gateway
 from conversation import chat_messages, is_data_request
 from chat_shell import apply_chat_shell, chat_composer
@@ -1606,6 +1606,9 @@ def safe_ollama_chat(model_name: str, prompt, options: Optional[Dict[str, Any]] 
         )
         try:
             st.session_state["ollama_runtime"] = _describe_llm_runtime(response, request_options)
+            if isinstance(response, dict) and response.get("usage"):
+                st.session_state["last_llm_usage"] = dict(response["usage"],
+                                                          label=response.get("provider_label") or "model")
             st.session_state.pop("last_ollama_error", None)
         except Exception:
             pass
@@ -3631,6 +3634,7 @@ with st.sidebar.expander("Appearance & data", expanded=False):
 models = get_installed_ollama_models()
 with st.sidebar:
     render_model_connection()
+    render_model_usage()
 question_preferred_order = ["qwen2.5:3b", "qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b"]
 schema_preferred_order = ["qwen3.5:9b", "qwen3:14b", "gemma3:12b", "gpt-oss:20b", "qwen2.5:3b"]
 

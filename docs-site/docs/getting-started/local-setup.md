@@ -2,6 +2,8 @@
 id: local-setup
 title: Run PANDA locally
 description: Start Ollama, qwen2.5:3b, Streamlit, and the documentation site.
+last_update:
+  date: 2026-11-01
 ---
 
 # Run PANDA locally

@@ -2,6 +2,8 @@
 id: sql-chat
 title: SQL integration and saved chat history
 description: How Canopy proves local SQLite use and persists conversations.
+last_update:
+  date: 2026-08-20
 ---
 
 # SQL integration and saved chat history

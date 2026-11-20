@@ -2,9 +2,15 @@
 id: irene-inference-gateway
 title: Irene inference gateway
 description: How Railway PANDA reaches the private Qwen model hosted on Irene.
+last_update:
+  date: 2026-11-20
 ---
 
 # Irene inference gateway
+
+:::note
+Until Railway can reach Irene, PANDA answers with hosted Groq or Gemini models and keeps Irene as the fallback. See [Model providers, fallback and usage](./model-providers.md).
+:::
 
 PANDA separates the public application from model hosting:
 
