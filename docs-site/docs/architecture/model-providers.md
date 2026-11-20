@@ -85,6 +85,26 @@ PANDA's counts include only requests made by PANDA. If the same Gemini key is
 used elsewhere, check the exact remaining quota at aistudio.google.com/rate-limit.
 For Groq, console.groq.com/settings/limits shows the account limits.
 
+## How data answers are written
+
+PANDA's SQL and Python tools compute the result (counts, filters, charts, map
+status). The model then writes the answer from those verified facts plus the
+dataset profile, including when something could not be done, such as a map
+for a CSV without coordinates. Every number in the model's answer is checked
+against the verified facts (rounding like "about 68,000" is allowed). If a
+number does not match, the model is asked once to correct it. A template
+answer is used only when AI answers are turned off or no model is reachable,
+and it is labelled "AI answer unavailable right now".
+
+## Flagging answers
+
+Each answer has a flag button. Choose what looks off (wrong numbers, made
+something up, doesn't answer, strange, formatting, other) and add a note.
+Flags are saved in `canopy.sqlite` (`response_flags`) with the question,
+answer and active model, and can be downloaded as CSV from the
+**Model connection** panel. The three-dots menu next to it holds developer
+details for data answers.
+
 ## Data note
 
 Prompts include dataset summaries and query results. On Gemini's free tier,

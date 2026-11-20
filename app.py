@@ -3019,125 +3019,58 @@ def explain_result(
     use_model_explanation: bool,
     selected_projected_crs: Optional[str],
 ) -> str:
-    if payload.get("intent") == "species_list":
-        return payload["verified_summary"]
-
+    """Model-written answer grounded in PANDA's verified result (templates only when AI is off/unreachable)."""
     map_requested = bool(payload.get("map_requested"))
     map_available = bool(payload.get("map_available"))
-
-    if map_requested and not map_available:
-        return payload["verified_summary"]
-
-    if not use_model_explanation:
-        if map_requested:
-            return "Here's your map. " + payload["verified_summary"]
-        return payload["verified_summary"]
-
-    if not use_model_explanation:
-        if payload.get("map_requested"):
-            return "Here’s your map. " + payload["verified_summary"]
-        return payload["verified_summary"]
-
-    user_facing_payload = {
-        "question": payload["question"],
-        "intent": payload["intent"],
-        "result_available": payload["result_available"],
-        "matching_record_count": payload["matching_record_count"],
-        "total_dataset_rows": payload["total_dataset_rows"],
-        "percent_of_dataset": payload["percent_of_dataset"],
-        "answer_subject": payload.get("answer_subject"),
-        "display_count_label": payload.get("display_count_label"),
-        "display_count_value": payload.get("display_count_value"),
-        "filters_used": payload["filters_used"],
-        "warnings": payload["warnings"],
-        "verified_summary": payload["verified_summary"],
-        "important_table": payload["important_table"][:10],
-    }
-
-    if payload.get("map_requested"):
-        if selected_projected_crs:
-            user_facing_payload["map_note"] = (
-                f"A map was requested. Coordinate rows available: {payload['coordinate_rows_in_dataset']}. "
-                f"The app transformed the coordinate values using {selected_projected_crs} so they can be displayed on the map."
-            )
-        else:
-            user_facing_payload["map_note"] = (
-                f"A map was requested. Coordinate rows available: {payload['coordinate_rows_in_dataset']}. "
-                "A coordinate system must be selected before these coordinates can be mapped."
-            )
-
+    template = payload["verified_summary"]
     if map_requested and map_available:
-        if payload.get("coordinate_kind") == "projected_crs_required" and selected_projected_crs:
-            user_facing_payload["map_note"] = (
-                f"A map was created for {payload.get('coordinate_rows_in_result', 0)} matching rows. "
-                f"The app transformed the coordinate values using {selected_projected_crs} so they can be displayed on the map."
-            )
+        template = "Here's your map. " + template
+    if not use_model_explanation:
+        return template
+
+    facts: Dict[str, Any] = {
+        "question": payload.get("question"),
+        "what_was_computed": payload.get("intent"),
+        "verified_summary": payload.get("verified_summary"),
+        "matching_records": payload.get("matching_record_count"),
+        "total_records_in_dataset": payload.get("total_dataset_rows"),
+        "percent_of_dataset": payload.get("percent_of_dataset"),
+        "subject": payload.get("answer_subject"),
+        "headline_count": {payload.get("display_count_label"): payload.get("display_count_value")}
+        if payload.get("display_count_label") else None,
+        "filters_used": payload.get("filters_used"),
+        "warnings": payload.get("warnings") or None,
+        "result_table_top_rows": (payload.get("important_table") or [])[:25] or None,
+    }
+    instruction = ""
+    if payload.get("intent") == "species_list":
+        instruction = ("The full species list is shown as a table under your answer, so summarize it: how many "
+                       "species/common names there are and which are most common. Do not list every species.")
+    if map_requested:
+        if map_available:
+            note = f"A map was created for {payload.get('coordinate_rows_in_result', 0)} matching rows with usable coordinates."
+            if payload.get("coordinate_kind") == "projected_crs_required" and selected_projected_crs:
+                note += f" Coordinates were converted from {selected_projected_crs} for display."
+            facts["map"] = note
+            instruction += " The map is shown under your answer; mention it briefly."
         else:
-            user_facing_payload["map_note"] = (
-                f"A map was created for {payload.get('coordinate_rows_in_result', 0)} matching rows with usable coordinates."
-            )
+            facts["map"] = {
+                "created": False,
+                "reason": payload.get("map_status_message") or "No usable coordinates were found.",
+                "rows_with_coordinates_in_dataset": payload.get("coordinate_rows_in_dataset"),
+                "coordinate_system_selected": selected_projected_crs,
+            }
+            instruction += (" No map could be made. Explain why in one sentence, say what the data would need "
+                            "(e.g. latitude/longitude columns, or X/Y columns with a known coordinate system), and "
+                            "offer a useful alternative from this dataset such as counts or a chart.")
+    facts = {k: v for k, v in facts.items() if v not in (None, "", [], {})}
 
-    if payload.get("map_requested"):
-        instruction = """
-Write a friendly, direct answer that starts with "Here’s your map."
-Then mention the key count and percent if available.
-Do not repeat the user's question.
-"""
-    else:
-        instruction = """
-Write a friendly, direct answer.
-Answer the user's question first, then briefly explain what the matched records mean.
-Mention the key count and percent if available.
-Do not repeat the user's question.
-"""
-
-    prompt = f"""
-Use only the verified facts below. Write 2 to 4 plain-English sentences.
-Do not invent facts. Do not recalculate numbers. Do not mention JSON or internal fields.
-If a map note is present, explain it in simple terms.
-If matching records are present, describe them as the answer to the question rather than merely saying records matched.
-If answer_subject is present, use that human phrase instead of internal filter wording.
-{instruction}
-
-Verified facts:
-{json.dumps(user_facing_payload, indent=2)}
-"""
-
-    text = safe_ollama_chat(
-        model_name,
-        prompt,
-        options={"temperature": 0.2, "num_predict": 220},
+    from grounded_answers import grounded_answer
+    text, _ = grounded_answer(
+        lambda model, messages, options=None: safe_ollama_chat(model, messages, options=options),
+        model_name, str(payload.get("question") or ""), facts, template,
+        dataset_context=st.session_state.get("active_dataset_context", ""), instruction=instruction,
     )
-
-    if not text:
-        if payload.get("map_requested"):
-            return "Here’s your map. " + payload["verified_summary"]
-        return payload["verified_summary"]
-
-    lowered = text.lower()
-
-    forbidden = [
-        "over 99%",
-        "almost all",
-        "forest surveyed",
-        "map_requested",
-        "json",
-        "coordinate information is not available",
-        "coordinates are not available",
-        "coordinate data is not available",
-    ]
-
-    if not payload.get("map_requested"):
-        forbidden.extend(["coordinate data", "coordinate rows", "missing coordinate"])
-
-    if any(term in lowered for term in forbidden):
-        if payload.get("map_requested"):
-            return "Here’s your map. " + payload["verified_summary"]
-        return payload["verified_summary"]
-
-    if payload.get("map_requested") and "map" not in lowered:
-        return "Here’s your map. " + text
-
     return text
 
 

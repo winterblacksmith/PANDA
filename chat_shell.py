@@ -43,6 +43,8 @@ def apply_chat_shell():
     .st-key-panda-chat-actions button {background:var(--panda-cta-bg)!important;color:var(--panda-cta-fg)!important;border:0!important;
         border-radius:10px;font-weight:600;box-shadow:0 6px 18px rgba(0,0,0,.30);transition:transform .15s, box-shadow .15s;}
     .st-key-panda-chat-actions button p {color:var(--panda-cta-fg)!important;font-weight:600;}
+    [data-testid="stSidebar"] .st-key-panda-chat-actions button:is(:hover, :focus, :focus-visible, :active) {
+        background:var(--panda-cta-bg)!important;color:var(--panda-cta-fg)!important;border:0!important;}
     .st-key-panda-chat-actions button:hover {transform:translateY(-1px);box-shadow:0 10px 24px rgba(0,0,0,.38);}
     .st-key-panda-active-dataset {background:var(--canopy-surface);border:1px solid var(--canopy-border);
         border-radius:12px;padding:.7rem .8rem .8rem;gap:.35rem;}

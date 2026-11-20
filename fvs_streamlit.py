@@ -47,22 +47,42 @@ def _explain(
     use_model: bool,
     safe_ollama_chat: Callable[..., str],
 ) -> str:
-    verified_summary = summarize_fvs_result(result_df, spec)
-    if result_df.empty or not use_model:
-        return verified_summary
-    prompt = f"""
-You are PANDA (PERSEUS AI for Natural Language Data Analysis), a forestry data assistant.
-Use only the verified facts below.
-Question: {question}
-Applied filters: {format_fvs_filters(spec)}
-Verified result: {verified_summary}
-Composition counts: {json.dumps(result_df['COMPOSITIO'].value_counts().to_dict())}
+    """Model-written answer grounded in the FVS SQL result (template only when AI is off/unreachable)."""
+    from grounded_answers import grounded_answer
 
-Answer in 2-4 clear sentences. Do not invent causes, units, trends, or model assumptions.
-Mention that the figures come from the local FVS stand-results table when useful.
-"""
-    answer = safe_ollama_chat(model_name, prompt, options={"temperature": 0.1})
-    return answer or verified_summary
+    verified_summary = summarize_fvs_result(result_df, spec)
+    if not use_model:
+        return verified_summary
+    facts: Dict[str, Any] = {
+        "source": "PANDA's FVS stand-results table (SQLite query)",
+        "filters_applied": format_fvs_filters(spec),
+        "verified_summary": verified_summary,
+        "matching_stands": int(len(result_df)),
+    }
+    if not result_df.empty:
+        facts.update({
+            "total_acres": round(float(result_df["Acres"].sum()), 1),
+            "mean_age_years": round(float(result_df["Age"].mean()), 1),
+            "estimated_total_volume_cu_ft (TCuFt x Acres)": round(float((result_df["TCuFt"] * result_df["Acres"]).sum())),
+            "stands_by_composition": result_df["COMPOSITIO"].value_counts().to_dict(),
+        })
+        if spec.get("intent") == "chart":
+            group = spec.get("chart_group") or "Age"
+            if group in result_df.columns:
+                facts[f"acres_by_{group}"] = (result_df.groupby(group)["Acres"].sum().round(1)
+                                              .sort_index().head(40).to_dict())
+    instruction = ("Stand counts, acres, ages and volumes come from the FVS stand table. Simulated ages are "
+                   "biased toward a handful of FIA plots, so avoid strong claims about real age structure.")
+    if spec.get("make_map") or spec.get("make_raster"):
+        instruction += " A stand map is shown under your answer when stands matched; mention it briefly."
+    if result_df.empty:
+        instruction += " No stands matched: say so and suggest a looser filter."
+    text, _ = grounded_answer(
+        lambda model, messages, options=None: safe_ollama_chat(model, messages, options=options),
+        model_name, question, facts, verified_summary,
+        dataset_context=st.session_state.get("active_dataset_context", ""), instruction=instruction,
+    )
+    return text
 
 
 def _render_result(

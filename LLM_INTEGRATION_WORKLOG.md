@@ -635,3 +635,23 @@ From the user's staging test (two PDF reports and screenshots):
 - Verification: 52 tests passed; app rendered locally and screenshotted in
   Forest and Light themes (welcome, chat, report menu, library dialog). Not yet
   verified on Railway.
+
+## 2026-11-20: Library redesign, answer flags, model-written data answers
+
+- Library dialog redesigned (rows with type icons, pill Analyze, Analyzing
+  badge, search + type filter, storage notice, visible close button). User's
+  staging screenshot showed the "not on a persistent volume" warning: the
+  Railway service has no volume at /app/storage yet.
+- Sidebar collapse/expand arrows were hidden until hover, grey on dark, and
+  covered by the wordmark; now always visible and clickable. Report download
+  icon was 2.5 px off-centre (Streamlit's -5px chevron margin); fixed.
+- `response_actions.py`: flag button on every answer (CSV, FVS, raster,
+  history and live) saving to `response_flags` in canopy.sqlite; CSV export in
+  Model connection; three-dots menu replaces "Response options".
+- `grounded_answers.py`: data answers (CSV results incl. species lists and
+  "map not possible", FVS results incl. no-match) are model-written from
+  verified facts + dataset profile; numbers checked against facts with one
+  correction retry; labelled template only when AI is off/unreachable. Removed
+  the keyword blocklist that discarded valid model answers.
+- Tests: 56 passed. Locally verified UI and the unreachable-model path; a live
+  model answer was not tested here (no keys in this environment).
