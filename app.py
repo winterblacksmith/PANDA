@@ -3545,7 +3545,7 @@ def render_assistant_results(
 # Streamlit UI
 # -----------------------------
 
-st.set_page_config(page_title=APP_NAME, layout="wide")
+st.set_page_config(page_title=APP_NAME, page_icon=str(Path(__file__).parent / "assets" / "panda-favicon.png"), layout="wide")
 
 if st.session_state.get("app_state_version") != APP_STATE_VERSION:
     for key in list(st.session_state.keys()):
@@ -3558,8 +3558,13 @@ if st.session_state.get("app_state_version") != APP_STATE_VERSION:
             del st.session_state[key]
     st.session_state["app_state_version"] = APP_STATE_VERSION
 
+# Remember the theme across refreshes: it is kept in the URL (?theme=Light), because Streamlit
+# starts a fresh session on every page load.
 if st.session_state.get("app_theme") not in THEME_PALETTES:
-    st.session_state["app_theme"] = "Forest"
+    url_theme = str(st.query_params.get("theme", "")).capitalize()
+    st.session_state["app_theme"] = url_theme if url_theme in THEME_PALETTES else "Forest"
+if st.query_params.get("theme") != st.session_state["app_theme"]:
+    st.query_params["theme"] = st.session_state["app_theme"]
 
 apply_app_theme(st.session_state["app_theme"])
 

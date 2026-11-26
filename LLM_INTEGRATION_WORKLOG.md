@@ -655,3 +655,24 @@ From the user's staging test (two PDF reports and screenshots):
   the keyword blocklist that discarded valid model answers.
 - Tests: 56 passed. Locally verified UI and the unreachable-model path; a live
   model answer was not tested here (no keys in this environment).
+
+## 2026-11-20: Theme persists across refresh; usage read errors shown
+
+- Theme reset to Forest on refresh because Streamlit starts a new session per
+  page load. The theme is now mirrored in the URL (`?theme=Light`) and read
+  back on load. Verified in Chrome: Light survives a reload.
+- Usage ring dropping to 0: usage counts live in
+  `PANDA_STORAGE_DIR/llm_usage.sqlite`; without a Railway volume each redeploy
+  starts empty. Separately, a failed usage read was shown as 0%; it now shows
+  "!" with "Usage could not be read". Groq's live request numbers return on the
+  next Groq answer.
+- Noted for design (not implemented): chats are shared across all visitors
+  because chat rows are keyed only by dataset, not by user.
+
+## 2026-11-20: Bamboo favicon
+
+Browser tab icon now uses the PANDA bamboo mark (stalk + leaves from
+`assets/panda-mark.svg`, without the orbit text, which is unreadable at 16 px)
+on a forest-green rounded tile: `assets/panda-favicon.svg` (source) and
+`assets/panda-favicon.png` (256 px, rendered with Chrome). Set via
+`st.set_page_config(page_icon=...)`; verified served as image/png.

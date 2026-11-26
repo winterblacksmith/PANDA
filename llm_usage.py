@@ -160,8 +160,9 @@ def summary(day: Optional[str] = None) -> Dict[str, Any]:
             ).fetchall()
             quota_rows = conn.execute("SELECT * FROM provider_quota").fetchall()
             quota_cols = [c[0] for c in conn.execute("SELECT * FROM provider_quota LIMIT 0").description]
-    except Exception:
-        rows, quota_rows, quota_cols = [], [], []
+    except Exception as exc:
+        # Report the failure instead of showing a misleading 0%.
+        return {"day": day, "providers": {}, "quotas": {}, "error": type(exc).__name__}
     for provider, model, requests, prompt, completion in rows:
         entry = providers.setdefault(provider, {"requests": 0, "prompt_tokens": 0,
                                                 "completion_tokens": 0, "models": []})
@@ -175,7 +176,7 @@ def summary(day: Optional[str] = None) -> Dict[str, Any]:
     for row in quota_rows:
         record_ = dict(zip(quota_cols, row))
         quotas[record_.pop("provider")] = record_
-    return {"day": day, "providers": providers, "quotas": quotas}
+    return {"day": day, "providers": providers, "quotas": quotas, "error": None}
 
 
 def remaining(used: int, limit: int) -> Optional[int]:
@@ -210,4 +211,4 @@ def provider_rows(day: Optional[str] = None, providers: Optional[List[str]] = No
             row["source"] = "reported by provider"
             row["live"] = quota
         rows.append(row)
-    return {"day": data["day"], "rows": rows}
+    return {"day": data["day"], "rows": rows, "error": data.get("error")}
